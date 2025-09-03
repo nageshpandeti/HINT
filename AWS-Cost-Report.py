@@ -1,7 +1,7 @@
 import boto3
 from datetime import datetime, timedelta
 
-ce = boto3.client("ce", region_name="us-east-1")
+ce = boto3.client("ce", region_name="ap-south-1")
 
 def get_cost():
     start = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
