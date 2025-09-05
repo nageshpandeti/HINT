@@ -42,7 +42,7 @@ def test_ssh_connection(node):
 def main():
     # 🔹 Add your managed nodes here
     managed_nodes = [
-        "ec2-user@13.233.15.116"
+        "ec2-user@172.31.47.169"
         # "ubuntu@<another-ip>",
         # "centos@<another-ip>"
     ]
