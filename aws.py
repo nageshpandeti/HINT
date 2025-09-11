@@ -259,4 +259,8 @@ This script will guide you step-by-step to create an EC2 instance.
         sys.exit(1)
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     main()
+=======
+    main()
+>>>>>>> ec04af13c76913e5fd63f395507ae8d04ab31a37

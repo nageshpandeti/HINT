@@ -19,7 +19,11 @@ echo "-----------------------------------"
 echo "📌 Docker Info:"
 docker info || echo "⚠️ Run 'docker info' after re-login as ec2-user."
 
+<<<<<<< HEAD
 echo "-----------------------------------"
+=======
+echo "-----------------------------------"vi    
+>>>>>>> ec04af13c76913e5fd63f395507ae8d04ab31a37
 echo "📌 Docker Service Status:"
 sudo systemctl status docker --no-pager | head -n 10
 
