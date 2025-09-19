@@ -1,0 +1,14 @@
+---
+- hosts: all
+  become: true
+
+
+  tasks:
+    #    - name: print all gathered facts 
+      #      ansible.builtin.debug:
+        #        vars: ansible_facts
+
+    - name: Shutdown Debian systems
+      ansible.builtin.command: /sbin/shutdown -t now
+      when: ansible_facts['os_family'] == 'Amazon Linux'
+~                                                        
