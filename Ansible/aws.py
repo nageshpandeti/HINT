@@ -211,7 +211,7 @@ This script will guide you step-by-step to create an EC2 instance.
     block_device_mappings = [{
         "DeviceName": "/dev/xvda",
         "Ebs": {
-            "VolumeSize": int(storage_size),
+            "VolumeSize":30,
             "DeleteOnTermination": True,
             "VolumeType": "gp2"
         }
