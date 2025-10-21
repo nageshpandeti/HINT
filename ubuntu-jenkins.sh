@@ -25,12 +25,14 @@ sudo apt update -y
 sudo apt install docker-ce docker-ce-cli containerd.io -y
 sudo usermod -aG docker $USER
 
-echo "🔐 Installing Jenkins..."
-curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io.key | sudo tee \
+echo "🔐 Installing Jenkins (with updated GPG key)..."
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | sudo tee \
   /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+
 echo \
   "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" | sudo tee \
   /etc/apt/sources.list.d/jenkins.list > /dev/null
+
 sudo apt update -y
 sudo apt install fontconfig openjdk-17-jre jenkins -y
 sudo systemctl enable jenkins
