@@ -1,4 +1,4 @@
-cat > /home/ubuntu/vault_keys.txt << 'EOF'
+cat > /home/ubuntu/key.txt << 'EOF'
 Key1: j2e08LUmuBDvZYeRENJU3hvUa2eOiRBrDsExHJID5Xz0
 Key2: t6WEYi4fSP6mu4u2ve7vMjEzeVB/Xh7Y1SZ2b6Z809Vt
 Key3: CJY6LHVJKnARRIevkqxFu/cxgohRS3mdmRrZPQbEo12S
