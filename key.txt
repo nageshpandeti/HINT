@@ -1,0 +1,8 @@
+cat > /home/ubuntu/vault_keys.txt << 'EOF'
+Key1: j2e08LUmuBDvZYeRENJU3hvUa2eOiRBrDsExHJID5Xz0
+Key2: t6WEYi4fSP6mu4u2ve7vMjEzeVB/Xh7Y1SZ2b6Z809Vt
+Key3: CJY6LHVJKnARRIevkqxFu/cxgohRS3mdmRrZPQbEo12S
+Key4: kmyUShV4XMQbwHXx8HgVOrQtBjKo4xrusnOuO7CdyoRW
+Key5: VpIfBqwNGCq928m2iuRen1fQ49yTkktWHvhn4eOLCqT/
+Token: hvs.BOIlccFZ25g3r3UUgtf1rGoR
+EOF
