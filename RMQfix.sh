@@ -1,9 +1,8 @@
 #!/bin/bash
 # =============================================================================
-#  RabbitMQ Exporter — All In One Script
-#  Includes : Uninstall + Install Go + Build Exporter + Service + Test
-#  Target   : Ubuntu 22.04 (VirtualBox)
-#  Usage    : sudo bash rmq_allinone.sh
+#  RabbitMQ Exporter — All In One Setup
+#  Phases  : Uninstall → RabbitMQ Fix → Install Go 1.22.3 → Build → Service → Test
+#  Usage   : sudo bash rmq_allinone.sh
 # =============================================================================
 
 RED='\033[0;31m'
@@ -20,17 +19,17 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 [[ $EUID -eq 0 ]] || error "Run as root: sudo bash $0"
 
-# ── Config ───────────────────────────────────────────────────────────────────
 RMQ_USER="admin"
 RMQ_PASS="admin123"
 EXPORTER_PORT="9419"
 EXPORTER_BINARY="/usr/local/bin/rabbitmq_exporter"
+GO_VERSION="1.22.3"
 GOPATH_DIR="/root/go"
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}║   RabbitMQ Exporter — All In One Setup                  ║${NC}"
-echo -e "${BOLD}║   Uninstall → Build from Source → Service → Test        ║${NC}"
+echo -e "${BOLD}║   Go ${GO_VERSION} + Build from Source + Systemd + Tests   ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  OS     : $(lsb_release -ds 2>/dev/null)"
@@ -39,155 +38,134 @@ echo -e "  Arch   : $(uname -m)"
 echo ""
 
 # =============================================================================
-# PHASE 1 — UNINSTALL OLD EXPORTER
+# PHASE 1 — UNINSTALL
 # =============================================================================
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  PHASE 1 — Uninstall Old Exporter${NC}"
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${CYAN}━━━  PHASE 1 — Uninstall Old Exporter  ━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-
-info "Stopping rabbitmq_exporter service ..."
 systemctl stop    rabbitmq_exporter 2>/dev/null || true
 systemctl disable rabbitmq_exporter 2>/dev/null || true
-
-info "Removing service file ..."
 rm -f /etc/systemd/system/rabbitmq_exporter.service
+rm -f "${EXPORTER_BINARY}"
+rm -rf "${GOPATH_DIR}/src/github.com/kbudde"
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
-
-info "Removing binary ..."
-rm -f "${EXPORTER_BINARY}"
-
-info "Removing system user ..."
-userdel rabbitmq_exporter 2>/dev/null || true
-
-info "Cleaning temp files ..."
-rm -f /tmp/rabbitmq_exporter*.tar.gz
-rm -rf /tmp/rabbitmq_exporter-*
-rm -rf "${GOPATH_DIR}/src/github.com/kbudde/rabbitmq_exporter"
-
-success "PHASE 1 COMPLETE — Old exporter removed"
+success "Old exporter removed"
 
 # =============================================================================
-# PHASE 2 — VERIFY RABBITMQ
+# PHASE 2 — RABBITMQ CHECK
 # =============================================================================
 echo ""
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  PHASE 2 — Verify & Fix RabbitMQ${NC}"
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${CYAN}━━━  PHASE 2 — Verify RabbitMQ  ━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-info "Checking RabbitMQ service ..."
-if ! systemctl is-active --quiet rabbitmq-server; then
-    info "Starting RabbitMQ ..."
-    systemctl start rabbitmq-server
-    sleep 5
-fi
+systemctl is-active --quiet rabbitmq-server || systemctl start rabbitmq-server
+sleep 3
 systemctl is-active --quiet rabbitmq-server \
-    && success "RabbitMQ is running" \
-    || error "RabbitMQ is not running — install RabbitMQ first"
+    && success "RabbitMQ running" \
+    || error "RabbitMQ not running"
 
-info "Enabling management plugin ..."
 rabbitmq-plugins enable rabbitmq_management > /dev/null 2>&1
-success "Management plugin enabled"
-
-info "Restarting RabbitMQ ..."
 systemctl restart rabbitmq-server
 sleep 6
-success "RabbitMQ restarted"
 
-info "Setting up admin user ..."
 rabbitmqctl delete_user guest 2>/dev/null || true
 rabbitmqctl add_user "${RMQ_USER}" "${RMQ_PASS}" 2>/dev/null \
     || rabbitmqctl change_password "${RMQ_USER}" "${RMQ_PASS}"
 rabbitmqctl set_user_tags "${RMQ_USER}" administrator
 rabbitmqctl set_permissions -p "/" "${RMQ_USER}" ".*" ".*" ".*"
-success "Admin user '${RMQ_USER}' ready"
+success "Admin user ready"
 
-info "Waiting for Management API on port 15672 ..."
+info "Waiting for Management API ..."
 for i in $(seq 1 20); do
     CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         -u "${RMQ_USER}:${RMQ_PASS}" \
         http://localhost:15672/api/overview 2>/dev/null || echo "000")
     [[ "${CODE}" == "200" ]] && { success "Management API ready ✅"; break; }
-    echo -n "  waiting ... ${i}/20"$'\r'
     sleep 3
 done
-echo ""
-
-success "PHASE 2 COMPLETE — RabbitMQ ready"
 
 # =============================================================================
-# PHASE 3 — INSTALL GO + BUILD EXPORTER FROM SOURCE
+# PHASE 3 — INSTALL LATEST GO
 # =============================================================================
 echo ""
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  PHASE 3 — Install Go & Build Exporter from Source${NC}"
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${CYAN}━━━  PHASE 3 — Install Go ${GO_VERSION}  ━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-info "Updating apt ..."
-apt-get update -qq
+# Remove old Go
+apt-get remove -y -qq golang golang-go 2>/dev/null || true
+rm -rf /usr/local/go
 
-info "Installing Go and Git ..."
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq golang git
+# Detect arch
+[[ "$(uname -m)" == "x86_64" ]] && GO_ARCH="amd64" || GO_ARCH="arm64"
+
+GO_TARBALL="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+GO_URL="https://go.dev/dl/${GO_TARBALL}"
+
+info "Downloading Go ${GO_VERSION} ..."
+wget -q --show-progress -O "/tmp/${GO_TARBALL}" "${GO_URL}" \
+    || error "Go download failed"
+
+info "Installing Go ..."
+tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
+rm -f "/tmp/${GO_TARBALL}"
+
+export PATH="/usr/local/go/bin:${PATH}"
+export GOPATH="${GOPATH_DIR}"
+export HOME=/root
+
 success "Go installed: $(go version)"
 
-export HOME=/root
-export GOPATH="${GOPATH_DIR}"
-export PATH="${PATH}:/usr/local/go/bin:${GOPATH_DIR}/bin"
+# =============================================================================
+# PHASE 4 — BUILD EXPORTER
+# =============================================================================
+echo ""
+echo -e "${BOLD}${CYAN}━━━  PHASE 4 — Build Exporter from Source  ━━━━━━━━━━━━━━━${NC}"
+echo ""
 
-info "Cloning rabbitmq_exporter source ..."
+apt-get install -y -qq git
+
 mkdir -p "${GOPATH_DIR}/src/github.com/kbudde"
 cd "${GOPATH_DIR}/src/github.com/kbudde"
-git clone --depth=1 https://github.com/kbudde/rabbitmq_exporter.git \
-    || error "Git clone failed — check internet"
-cd rabbitmq_exporter
-success "Source cloned"
+rm -rf rabbitmq_exporter
 
-info "Downloading Go dependencies ..."
+info "Cloning source ..."
+git clone --depth=1 https://github.com/kbudde/rabbitmq_exporter.git \
+    || error "Clone failed"
+cd rabbitmq_exporter
+success "Cloned"
+
+info "Downloading dependencies ..."
 go mod download
 success "Dependencies ready"
 
-info "Building binary (this takes ~2 minutes) ..."
+info "Building binary (~2 minutes) ..."
 go build -o "${EXPORTER_BINARY}" .
-success "Build complete"
 
-info "Setting permissions ..."
+[[ -f "${EXPORTER_BINARY}" ]] \
+    && success "Binary built ✅" \
+    || error "Build failed — binary not created"
+
 chmod 755 "${EXPORTER_BINARY}"
 chown root:root "${EXPORTER_BINARY}"
 
-info "Binary details:"
+info "Binary:"
 ls -la "${EXPORTER_BINARY}"
 file "${EXPORTER_BINARY}"
-echo ""
 
 info "Testing binary ..."
 "${EXPORTER_BINARY}" --help > /dev/null 2>&1
-EXIT_CODE=$?
-if [[ ${EXIT_CODE} -le 1 ]]; then
-    success "Binary runs correctly ✅"
-else
-    "${EXPORTER_BINARY}" 2>&1 | head -5
-    error "Binary cannot run — exit code ${EXIT_CODE}"
-fi
-
-success "PHASE 3 COMPLETE — Binary built and ready"
+[[ $? -le 1 ]] && success "Binary works ✅" || error "Binary cannot run"
 
 # =============================================================================
-# PHASE 4 — CREATE SYSTEMD SERVICE
+# PHASE 5 — SYSTEMD SERVICE
 # =============================================================================
 echo ""
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  PHASE 4 — Create Systemd Service${NC}"
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${CYAN}━━━  PHASE 5 — Systemd Service  ━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-info "Writing systemd service file ..."
 cat > /etc/systemd/system/rabbitmq_exporter.service << EOF
 [Unit]
 Description=RabbitMQ Prometheus Exporter
-Documentation=https://github.com/kbudde/rabbitmq_exporter
 After=network.target rabbitmq-server.service
 Wants=rabbitmq-server.service
 
@@ -197,7 +175,6 @@ Group=root
 Type=simple
 Restart=on-failure
 RestartSec=10s
-TimeoutStartSec=90
 
 Environment="RABBIT_URL=http://localhost:15672"
 Environment="RABBIT_USER=${RMQ_USER}"
@@ -216,77 +193,62 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-info "Reloading systemd ..."
 systemctl daemon-reload
-
-info "Enabling service ..."
 systemctl enable rabbitmq_exporter
-
-info "Starting service ..."
 systemctl start rabbitmq_exporter
 sleep 6
 
-info "Service status:"
-systemctl status rabbitmq_exporter --no-pager -l | head -10
+systemctl status rabbitmq_exporter --no-pager | head -8
 echo ""
 
 systemctl is-active --quiet rabbitmq_exporter \
-    && success "PHASE 4 COMPLETE — Service running ✅" \
+    && success "Service running ✅" \
     || { journalctl -u rabbitmq_exporter -n 20 --no-pager; error "Service failed"; }
 
 # =============================================================================
-# PHASE 5 — LOCAL TESTS
+# PHASE 6 — TESTS
 # =============================================================================
 echo ""
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  PHASE 5 — Local Tests${NC}"
-echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}${CYAN}━━━  PHASE 6 — Local Tests  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
 PASS=0; FAIL=0
-
 check() {
     local NAME="$1" CMD="$2" EXPECT="$3" OUT
     OUT=$(eval "${CMD}" 2>&1 || true)
     if echo "${OUT}" | grep -q "${EXPECT}"; then
         echo -e "  ${GREEN}✔${NC}  ${NAME}"; PASS=$((PASS+1))
     else
-        echo -e "  ${RED}✘${NC}  ${NAME}"
-        echo -e "       Got : $(echo "${OUT}" | head -1)"
-        FAIL=$((FAIL+1))
+        echo -e "  ${RED}✘${NC}  ${NAME}"; echo -e "       Got : $(echo "${OUT}" | head -1)"; FAIL=$((FAIL+1))
     fi
 }
 
-echo -e "  ${BOLD}── Services ──────────────────────────────────────────────${NC}"
-check "rabbitmq-server active"    "systemctl is-active rabbitmq-server"    "active"
-check "rabbitmq_exporter active"  "systemctl is-active rabbitmq_exporter"  "active"
+echo -e "  ${BOLD}── Services ──${NC}"
+check "rabbitmq-server active"    "systemctl is-active rabbitmq-server"   "active"
+check "rabbitmq_exporter active"  "systemctl is-active rabbitmq_exporter" "active"
 
 echo ""
-echo -e "  ${BOLD}── Ports ─────────────────────────────────────────────────${NC}"
-check "AMQP       5672  open"     "ss -tlnp | grep ':5672'"                "5672"
-check "Management 15672 open"     "ss -tlnp | grep ':15672'"               "15672"
-check "Exporter   9419  open"     "ss -tlnp | grep ':9419'"                "9419"
+echo -e "  ${BOLD}── Ports ──${NC}"
+check "Port 5672  open"  "ss -tlnp | grep ':5672'"  "5672"
+check "Port 15672 open"  "ss -tlnp | grep ':15672'" "15672"
+check "Port 9419  open"  "ss -tlnp | grep ':9419'"  "9419"
 
 echo ""
-echo -e "  ${BOLD}── API & Metrics ─────────────────────────────────────────${NC}"
+echo -e "  ${BOLD}── Metrics ──${NC}"
 check "Management API health"     "curl -sf -u ${RMQ_USER}:${RMQ_PASS} http://localhost:15672/api/healthchecks/node" "ok"
 check "Exporter /metrics working" "curl -sf http://localhost:${EXPORTER_PORT}/metrics"                               "rabbitmq_"
 check "Queue metrics present"     "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_queue"         "rabbitmq_queue"
 check "Node  metrics present"     "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_node"          "rabbitmq_node"
 check "Up    metric  present"     "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_up"            "rabbitmq_up"
 
-MCOUNT=$(curl -sf "http://localhost:${EXPORTER_PORT}/metrics" \
-    | grep -v "^#" | wc -l 2>/dev/null || echo "0")
+MCOUNT=$(curl -sf "http://localhost:${EXPORTER_PORT}/metrics" | grep -v "^#" | wc -l 2>/dev/null || echo "0")
+IP=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
-echo -e "  Passed : ${GREEN}${BOLD}${PASS}${NC}   Failed : ${RED}${BOLD}${FAIL}${NC}   Total metrics : ${GREEN}${BOLD}${MCOUNT}${NC}"
+echo -e "  Passed : ${GREEN}${BOLD}${PASS}${NC}   Failed : ${RED}${BOLD}${FAIL}${NC}   Metrics : ${GREEN}${BOLD}${MCOUNT}${NC}"
 echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
 
-# =============================================================================
-# FINAL SUMMARY
-# =============================================================================
-IP=$(hostname -I | awk '{print $1}')
 echo ""
 if [[ ${FAIL} -eq 0 ]]; then
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -299,19 +261,16 @@ else
 fi
 
 echo ""
-echo -e "  ${BOLD}Access URLs:${NC}"
-echo -e "    Exporter    →  http://${IP}:${EXPORTER_PORT}/metrics"
-echo -e "    Mgmt UI     →  http://${IP}:15672"
-echo -e "    Login       →  ${RMQ_USER} / ${RMQ_PASS}"
-echo -e "    Metrics     →  ${MCOUNT} total"
+echo -e "  Exporter  →  http://${IP}:${EXPORTER_PORT}/metrics"
+echo -e "  Mgmt UI   →  http://${IP}:15672   (${RMQ_USER} / ${RMQ_PASS})"
+echo -e "  Metrics   →  ${MCOUNT} total"
 echo ""
-echo -e "  ${BOLD}Quick test commands:${NC}"
+echo -e "  ${BOLD}Test commands:${NC}"
 echo -e "    curl -s http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_queue"
 echo -e "    curl -s http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_node"
 echo -e "    curl -s http://localhost:${EXPORTER_PORT}/metrics | grep -v '^#' | wc -l"
 echo ""
 echo -e "  ${BOLD}Service commands:${NC}"
 echo -e "    systemctl status  rabbitmq_exporter"
-echo -e "    systemctl restart rabbitmq_exporter"
 echo -e "    journalctl -u rabbitmq_exporter -f"
 echo ""
