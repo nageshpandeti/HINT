@@ -1,8 +1,7 @@
 #!/bin/bash
 # =============================================================================
-#  RabbitMQ Exporter — Direct Binary Install Fix
-#  Error   : No such file or directory at /usr/local/bin/rabbitmq_exporter
-#  Usage   : sudo bash rmq_binary_fix.sh
+#  RabbitMQ Exporter — Install via Go (bypasses binary compatibility issues)
+#  Usage : sudo bash rmq_go_install.sh
 # =============================================================================
 
 RED='\033[0;31m'
@@ -21,88 +20,81 @@ RMQ_USER="admin"
 RMQ_PASS="admin123"
 EXPORTER_PORT="9419"
 EXPORTER_BINARY="/usr/local/bin/rabbitmq_exporter"
-VERSION="0.29.0"
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   Fix: Binary Not Found — Direct Install             ║${NC}"
+echo -e "${BOLD}║   RabbitMQ Exporter — Install via Go Build          ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
 # =============================================================================
-# STEP 1 — Stop service
+# STEP 1 — System info
 # =============================================================================
-info "Stopping service ..."
-systemctl stop rabbitmq_exporter 2>/dev/null || true
-systemctl disable rabbitmq_exporter 2>/dev/null || true
-sleep 2
-success "Service stopped"
+info "System info:"
+echo "  OS     : $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2)"
+echo "  Kernel : $(uname -r)"
+echo "  Arch   : $(uname -m)"
+echo "  Bits   : $(getconf LONG_BIT)"
+echo ""
 
 # =============================================================================
-# STEP 2 — Clean temp files
+# STEP 2 — Stop old service
 # =============================================================================
-info "Cleaning old temp files ..."
-rm -f /tmp/rabbitmq_exporter*.tar.gz
-rm -rf /tmp/rabbitmq_exporter-*
+info "Stopping old service ..."
+systemctl stop rabbitmq_exporter 2>/dev/null || true
 rm -f "${EXPORTER_BINARY}"
 success "Cleaned"
 
 # =============================================================================
-# STEP 3 — Download fresh binary
+# STEP 3 — Install Go
 # =============================================================================
-info "Downloading rabbitmq_exporter v${VERSION} ..."
-
-TARBALL="rabbitmq_exporter-${VERSION}.linux-amd64.tar.gz"
-URL="https://github.com/kbudde/rabbitmq_exporter/releases/download/v${VERSION}/${TARBALL}"
-
-cd /tmp
-wget -q --show-progress -O "${TARBALL}" "${URL}" \
-    || error "Download failed"
-
-info "Download complete. Verifying ..."
-ls -lh "/tmp/${TARBALL}"
-file "/tmp/${TARBALL}"
+info "Installing Go ..."
+DEBIAN_FRONTEND=noninteractive apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq golang git
+success "Go installed: $(go version)"
 
 # =============================================================================
-# STEP 4 — Extract and install binary
+# STEP 4 — Build rabbitmq_exporter from source
 # =============================================================================
-info "Extracting ..."
-tar -xzf "${TARBALL}" -C /tmp/
+info "Building rabbitmq_exporter from source ..."
 
-info "Looking for binary ..."
-BINARY_PATH=$(find /tmp -name "rabbitmq_exporter" -type f 2>/dev/null | head -1)
-echo "  Found at: ${BINARY_PATH}"
+export HOME=/root
+export GOPATH=/root/go
+export PATH=$PATH:/usr/local/go/bin
 
-[[ -z "${BINARY_PATH}" ]] && error "Binary not found after extraction"
+mkdir -p "${GOPATH}/src/github.com/kbudde"
+cd "${GOPATH}/src/github.com/kbudde"
 
-info "Installing to ${EXPORTER_BINARY} ..."
-cp "${BINARY_PATH}" "${EXPORTER_BINARY}"
-chmod 755 "${EXPORTER_BINARY}"
-chown root:root "${EXPORTER_BINARY}"
+# Clone source
+rm -rf rabbitmq_exporter
+git clone --depth=1 https://github.com/kbudde/rabbitmq_exporter.git
+cd rabbitmq_exporter
 
-success "Binary installed"
+info "Downloading Go dependencies ..."
+go mod download
 
-info "Verify binary exists:"
+info "Building binary (this takes 1-2 minutes) ..."
+go build -o "${EXPORTER_BINARY}" .
+
+success "Build complete"
+
+# =============================================================================
+# STEP 5 — Verify binary
+# =============================================================================
+info "Verifying binary ..."
 ls -la "${EXPORTER_BINARY}"
 file "${EXPORTER_BINARY}"
+chmod 755 "${EXPORTER_BINARY}"
+
+info "Testing binary ..."
+"${EXPORTER_BINARY}" --help > /dev/null 2>&1
+EXIT_CODE=$?
+[[ ${EXIT_CODE} -le 1 ]] \
+    && success "Binary works ✅" \
+    || error "Binary still failing (exit ${EXIT_CODE})"
 
 # =============================================================================
-# STEP 5 — Test binary directly
-# =============================================================================
-info "Testing binary directly ..."
-"${EXPORTER_BINARY}" --help > /dev/null 2>&1 \
-    && success "Binary runs correctly ✅" \
-    || error "Binary still cannot run"
-
-# =============================================================================
-# STEP 6 — Clean temp
-# =============================================================================
-rm -f "/tmp/${TARBALL}"
-rm -rf /tmp/rabbitmq_exporter-*
-success "Temp files cleaned"
-
-# =============================================================================
-# STEP 7 — Rewrite and start service
+# STEP 6 — Systemd service
 # =============================================================================
 info "Writing systemd service ..."
 cat > /etc/systemd/system/rabbitmq_exporter.service << EOF
@@ -140,16 +132,12 @@ systemctl enable rabbitmq_exporter
 systemctl start rabbitmq_exporter
 sleep 5
 
-if systemctl is-active --quiet rabbitmq_exporter; then
-    success "rabbitmq_exporter service running ✅"
-else
-    echo ""
-    journalctl -u rabbitmq_exporter -n 20 --no-pager
-    error "Service still failing — see logs above"
-fi
+systemctl is-active --quiet rabbitmq_exporter \
+    && success "rabbitmq_exporter service running ✅" \
+    || { journalctl -u rabbitmq_exporter -n 20 --no-pager; error "Service failed"; }
 
 # =============================================================================
-# STEP 8 — Final tests
+# STEP 7 — Tests
 # =============================================================================
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
@@ -158,16 +146,13 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 
 PASS=0; FAIL=0
-
 check() {
     local NAME="$1" CMD="$2" EXPECT="$3" OUT
     OUT=$(eval "${CMD}" 2>&1 || true)
     if echo "${OUT}" | grep -q "${EXPECT}"; then
         echo -e "  ${GREEN}✔${NC}  ${NAME}"; PASS=$((PASS+1))
     else
-        echo -e "  ${RED}✘${NC}  ${NAME}"
-        echo -e "       Got: $(echo "${OUT}" | head -1)"
-        FAIL=$((FAIL+1))
+        echo -e "  ${RED}✘${NC}  ${NAME}"; echo -e "       Got: $(echo "${OUT}" | head -1)"; FAIL=$((FAIL+1))
     fi
 }
 
@@ -181,8 +166,7 @@ check "Exporter metrics working" "curl -sf http://localhost:${EXPORTER_PORT}/met
 check "Queue metrics present"    "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_queue"         "rabbitmq_queue"
 check "Node metrics present"     "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_node"          "rabbitmq_node"
 
-MCOUNT=$(curl -sf "http://localhost:${EXPORTER_PORT}/metrics" \
-    | grep -v "^#" | wc -l 2>/dev/null || echo "0")
+MCOUNT=$(curl -sf "http://localhost:${EXPORTER_PORT}/metrics" | grep -v "^#" | wc -l 2>/dev/null || echo "0")
 IP=$(hostname -I | awk '{print $1}')
 
 echo ""
@@ -193,11 +177,11 @@ echo ""
 
 if [[ ${FAIL} -eq 0 ]]; then
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}${BOLD}║      ALL DONE — RabbitMQ Exporter Ready  🐇         ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ALL DONE — RabbitMQ Exporter Ready  🐇            ║${NC}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 else
     echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}${BOLD}║      STILL ISSUES — Share output above              ║${NC}"
+    echo -e "${RED}${BOLD}║   STILL ISSUES — Share output above                 ║${NC}"
     echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 fi
 
