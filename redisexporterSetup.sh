@@ -1,114 +1,264 @@
-#!/bin/bash
-# setup_redis_exporter.sh
-# End-to-end Redis + Redis Exporter + Prometheus setup on Ubuntu VM
-# Run as: bash setup_redis_exporter.sh
+---
+# redis_exporter_complete.yml
+# Complete Ansible playbook: Install + Configure + Verify + Cleanup Redis & Redis Exporter
+# Usage:
+#   ansible-playbook redis_exporter_complete.yml
+#   (runs locally on the same machine — no separate inventory needed)
 
-set -e
+- name: Complete Redis + Redis Exporter Setup, Verify and Cleanup
+  hosts: localhost
+  connection: local
+  become: true
 
-echo "===== [1/5] Updating packages ====="
-sudo apt-get update -y
+  vars:
+    redis_exporter_version: "1.62.0"
+    redis_exporter_arch: "amd64"
+    redis_exporter_port: 9121
+    redis_host: "127.0.0.1"
+    redis_port: 6379
+    redis_password: ""
 
-# ─────────────────────────────────────────
-# REDIS
-# ─────────────────────────────────────────
-echo "===== [2/5] Installing Redis ====="
-sudo apt-get install -y redis-server
+  tasks:
 
-# Enable and start Redis
-sudo systemctl enable redis-server
-sudo systemctl start redis-server
+    # ─────────────────────────────────────────
+    # STEP 1 — SYSTEM UPDATE
+    # ─────────────────────────────────────────
+    - name: "[1/7] Update apt cache"
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
 
-# Quick sanity check
-redis-cli ping   # Should print: PONG
+    - name: "[1/7] Install required system packages"
+      apt:
+        name:
+          - curl
+          - wget
+          - tar
+          - python3
+        state: present
 
-# ─────────────────────────────────────────
-# REDIS EXPORTER
-# ─────────────────────────────────────────
-echo "===== [3/5] Installing Redis Exporter ====="
+    # ─────────────────────────────────────────
+    # STEP 2 — INSTALL REDIS
+    # ─────────────────────────────────────────
+    - name: "[2/7] Install Redis server and tools"
+      apt:
+        name:
+          - redis-server
+          - redis-tools
+        state: present
 
-EXPORTER_VERSION="1.62.0"
-ARCH="amd64"
-TARBALL="redis_exporter-v${EXPORTER_VERSION}.linux-${ARCH}.tar.gz"
-DOWNLOAD_URL="https://github.com/oliver006/redis_exporter/releases/download/v${EXPORTER_VERSION}/${TARBALL}"
+    - name: "[2/7] Ensure Redis config allows local connections"
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^bind "
+        line: "bind 127.0.0.1 ::1"
+        backup: true
 
-cd /tmp
-wget -q "$DOWNLOAD_URL" -O "$TARBALL"
-tar -xzf "$TARBALL"
-sudo mv "redis_exporter-v${EXPORTER_VERSION}.linux-${ARCH}/redis_exporter" /usr/local/bin/
-sudo chmod +x /usr/local/bin/redis_exporter
+    - name: "[2/7] Enable and start Redis service"
+      systemd:
+        name: redis-server
+        enabled: true
+        state: started
+        daemon_reload: true
 
-# Create a systemd service for redis_exporter
-sudo tee /etc/systemd/system/redis_exporter.service > /dev/null <<EOF
-[Unit]
-Description=Redis Exporter
-After=network.target redis-server.service
+    - name: "[2/7] Wait for Redis port to be ready"
+      wait_for:
+        host: "{{ redis_host }}"
+        port: "{{ redis_port }}"
+        timeout: 30
 
-[Service]
-User=nobody
-ExecStart=/usr/local/bin/redis_exporter \
-  --redis.addr=redis://127.0.0.1:6379 \
-  --web.listen-address=0.0.0.0:9121
-Restart=on-failure
-RestartSec=5s
+    - name: "[2/7] Ping Redis to confirm it is up"
+      command: redis-cli ping
+      register: redis_ping
+      changed_when: false
+      failed_when: redis_ping.stdout != "PONG"
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    - name: "[2/7] Show Redis ping result"
+      debug:
+        msg: "Redis responded with: {{ redis_ping.stdout }}"
 
-sudo systemctl daemon-reload
-sudo systemctl enable redis_exporter
-sudo systemctl start redis_exporter
+    # ─────────────────────────────────────────
+    # STEP 3 — SEED TEST DATA INTO REDIS
+    # ─────────────────────────────────────────
+    - name: "[3/7] Set a test string key"
+      command: redis-cli SET test_key "hello_from_ansible"
+      changed_when: true
 
-# ─────────────────────────────────────────
-# PROMETHEUS (optional but recommended)
-# ─────────────────────────────────────────
-echo "===== [4/5] Installing Prometheus ====="
+    - name: "[3/7] Increment a counter key"
+      command: redis-cli INCR hit_counter
+      changed_when: true
 
-PROM_VERSION="2.51.2"
-PROM_TARBALL="prometheus-${PROM_VERSION}.linux-${ARCH}.tar.gz"
-PROM_URL="https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${PROM_TARBALL}"
+    - name: "[3/7] Push items to a list"
+      command: redis-cli LPUSH test_list alpha beta gamma
+      changed_when: true
 
-cd /tmp
-wget -q "$PROM_URL" -O "$PROM_TARBALL"
-tar -xzf "$PROM_TARBALL"
-sudo mv "prometheus-${PROM_VERSION}.linux-${ARCH}/prometheus" /usr/local/bin/
-sudo mv "prometheus-${PROM_VERSION}.linux-${ARCH}/promtool"   /usr/local/bin/
+    - name: "[3/7] Set a key with TTL (60 seconds)"
+      command: redis-cli SET expiring_key "bye" EX 60
+      changed_when: true
 
-# Prometheus config — scrapes redis_exporter every 15s
-sudo mkdir -p /etc/prometheus
-sudo tee /etc/prometheus/prometheus.yml > /dev/null <<EOF
-global:
-  scrape_interval: 15s
+    - name: "[3/7] Add items to a set"
+      command: redis-cli SADD test_set "one" "two" "three"
+      changed_when: true
 
-scrape_configs:
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['localhost:9121']
-EOF
+    - name: "[3/7] Confirm test keys exist"
+      command: redis-cli KEYS "*"
+      register: redis_keys
+      changed_when: false
 
-# Systemd service for Prometheus
-sudo tee /etc/systemd/system/prometheus.service > /dev/null <<EOF
-[Unit]
-Description=Prometheus
-After=network.target
+    - name: "[3/7] Show seeded keys"
+      debug:
+        msg: "Keys in Redis: {{ redis_keys.stdout_lines }}"
 
-[Service]
-User=nobody
-ExecStart=/usr/local/bin/prometheus \
-  --config.file=/etc/prometheus/prometheus.yml \
-  --storage.tsdb.path=/var/lib/prometheus \
-  --web.listen-address=0.0.0.0:9090
-Restart=on-failure
+    # ─────────────────────────────────────────
+    # STEP 4 — INSTALL REDIS EXPORTER
+    # ─────────────────────────────────────────
+    - name: "[4/7] Set exporter tarball filename"
+      set_fact:
+        exporter_tarball: "redis_exporter-v{{ redis_exporter_version }}.linux-{{ redis_exporter_arch }}.tar.gz"
+        exporter_dir: "redis_exporter-v{{ redis_exporter_version }}.linux-{{ redis_exporter_arch }}"
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    - name: "[4/7] Download Redis Exporter tarball"
+      get_url:
+        url: "https://github.com/oliver006/redis_exporter/releases/download/v{{ redis_exporter_version }}/{{ exporter_tarball }}"
+        dest: "/tmp/{{ exporter_tarball }}"
+        mode: "0644"
 
-sudo mkdir -p /var/lib/prometheus
-sudo chown nobody:nogroup /var/lib/prometheus
+    - name: "[4/7] Extract Redis Exporter"
+      unarchive:
+        src: "/tmp/{{ exporter_tarball }}"
+        dest: /tmp/
+        remote_src: true
 
-sudo systemctl daemon-reload
-sudo systemctl enable prometheus
-sudo systemctl start prometheus
+    - name: "[4/7] Install Redis Exporter binary to /usr/local/bin"
+      copy:
+        src: "/tmp/{{ exporter_dir }}/redis_exporter"
+        dest: /usr/local/bin/redis_exporter
+        mode: "0755"
+        remote_src: true
 
-echo "===== [5/5] Setup complete! ====="
+    - name: "[4/7] Verify Redis Exporter binary exists"
+      stat:
+        path: /usr/local/bin/redis_exporter
+      register: exporter_bin
+      failed_when: not exporter_bin.stat.exists
+
+    - name: "[4/7] Create Redis Exporter systemd service (no auth)"
+      copy:
+        dest: /etc/systemd/system/redis_exporter.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Redis Exporter
+          After=network.target redis-server.service
+
+          [Service]
+          User=nobody
+          ExecStart=/usr/local/bin/redis_exporter \
+            --redis.addr=redis://{{ redis_host }}:{{ redis_port }} \
+            --web.listen-address=0.0.0.0:{{ redis_exporter_port }}
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+      when: redis_password == ""
+
+    - name: "[4/7] Create Redis Exporter systemd service (with auth)"
+      copy:
+        dest: /etc/systemd/system/redis_exporter.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Redis Exporter
+          After=network.target redis-server.service
+
+          [Service]
+          User=nobody
+          ExecStart=/usr/local/bin/redis_exporter \
+            --redis.addr=redis://{{ redis_host }}:{{ redis_port }} \
+            --redis.password={{ redis_password }} \
+            --web.listen-address=0.0.0.0:{{ redis_exporter_port }}
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+      when: redis_password != ""
+
+    - name: "[4/7] Reload systemd and enable Redis Exporter"
+      systemd:
+        name: redis_exporter
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: "[4/7] Wait for Redis Exporter metrics port to be ready"
+      wait_for:
+        host: "{{ redis_host }}"
+        port: "{{ redis_exporter_port }}"
+        timeout: 30
+
+    # ─────────────────────────────────────────
+    # STEP 5 — VERIFY METRICS
+    # ─────────────────────────────────────────
+    - name: "[5/7] Fetch /metrics from Redis Exporter"
+      uri:
+        url: "http://{{ redis_host }}:{{ redis_exporter_port }}/metrics"
+        return_content: true
+      register: metrics_output
+
+    - name: "[5/7] Assert redis_up is 1"
+      assert:
+        that:
+          - "'redis_up 1' in metrics_output.content"
+        fail_msg: "FAILED — redis_up metric not found or Redis is down!"
+        success_msg: "PASSED — Redis Exporter is up and redis_up = 1"
+
+    - name: "[5/7] Show key metrics"
+      debug:
+        msg: "{{ metrics_output.content
+              | regex_findall('(?m)^(redis_up|redis_connected_clients|redis_used_memory_bytes|redis_keyspace_hits_total|redis_keyspace_misses_total|redis_commands_processed_total)[^\n]*') }}"
+
+    - name: "[5/7] Check Redis Exporter service status"
+      command: systemctl is-active redis_exporter
+      register: exporter_status
+      changed_when: false
+      failed_when: exporter_status.stdout != "active"
+
+    - name: "[5/7] Show service status"
+      debug:
+        msg: "redis_exporter service is: {{ exporter_status.stdout }}"
+
+    # ─────────────────────────────────────────
+    # STEP 6 — CLEANUP TEMP FILES
+    # ─────────────────────────────────────────
+    - name: "[6/7] Remove downloaded tarball"
+      file:
+        path: "/tmp/{{ exporter_tarball }}"
+        state: absent
+
+    - name: "[6/7] Remove extracted exporter directory"
+      file:
+        path: "/tmp/{{ exporter_dir }}"
+        state: absent
+
+    # ─────────────────────────────────────────
+    # STEP 7 — FINAL SUMMARY
+    # ─────────────────────────────────────────
+    - name: "[7/7] Final summary"
+      debug:
+        msg:
+          - "============================================"
+          - " Redis + Redis Exporter setup complete!    "
+          - "============================================"
+          - "  Redis          : {{ redis_host }}:{{ redis_port }}"
+          - "  Redis Exporter : {{ redis_host }}:{{ redis_exporter_port }}"
+          - "  Metrics URL    : http://{{ redis_host }}:{{ redis_exporter_port }}/metrics"
+          - "  Service status : {{ exporter_status.stdout }}"
+          - "============================================"
+          - "  Useful commands:"
+          - "  curl http://localhost:{{ redis_exporter_port }}/metrics"
+          - "  systemctl status redis_exporter"
+          - "  systemctl status redis-server"
+          - "  journalctl -u redis_exporter -f"
+          - "============================================"
