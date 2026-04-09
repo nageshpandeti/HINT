@@ -1,190 +1,110 @@
 #!/bin/bash
 # =============================================================================
-#  RabbitMQ Exporter — Deep Fix Script
-#  Usage : sudo bash rmq_deepfix.sh
+#  RabbitMQ Exporter — Direct Binary Install Fix
+#  Error   : No such file or directory at /usr/local/bin/rabbitmq_exporter
+#  Usage   : sudo bash rmq_binary_fix.sh
 # =============================================================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-[[ $EUID -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
+[[ $EUID -eq 0 ]] || error "Run as root: sudo bash $0"
 
 RMQ_USER="admin"
 RMQ_PASS="admin123"
 EXPORTER_PORT="9419"
 EXPORTER_BINARY="/usr/local/bin/rabbitmq_exporter"
+VERSION="0.29.0"
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   RabbitMQ Exporter — Deep Fix                      ║${NC}"
+echo -e "${BOLD}║   Fix: Binary Not Found — Direct Install             ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
 # =============================================================================
-# STEP 1 — Show exact logs
+# STEP 1 — Stop service
 # =============================================================================
-echo -e "${BOLD}${CYAN}━━━  EXACT LOGS  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-
-info "Exporter journal logs:"
-journalctl -u rabbitmq_exporter -n 30 --no-pager
-echo ""
-
-info "RabbitMQ journal logs:"
-journalctl -u rabbitmq-server -n 15 --no-pager
-echo ""
-
-info "All listening ports:"
-ss -tlnp
-echo ""
-
-info "Binary check:"
-ls -la "${EXPORTER_BINARY}" 2>/dev/null || warn "Binary not found at ${EXPORTER_BINARY}"
-file "${EXPORTER_BINARY}" 2>/dev/null || true
-echo ""
-
-info "Test binary directly:"
-timeout 5 "${EXPORTER_BINARY}" --help 2>&1 | head -5 || warn "Binary test failed"
-echo ""
-
-info "RabbitMQ users:"
-rabbitmqctl list_users 2>/dev/null
-echo ""
-
-info "RabbitMQ plugins:"
-rabbitmq-plugins list -e 2>/dev/null
-echo ""
-
-info "Test management API directly:"
-curl -v -u "${RMQ_USER}:${RMQ_PASS}" \
-    http://localhost:15672/api/overview 2>&1 | tail -10
-echo ""
-
-# =============================================================================
-# STEP 2 — Kill any stuck exporter processes
-# =============================================================================
-echo -e "${BOLD}${CYAN}━━━  CLEANUP  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-
-info "Killing any stuck rabbitmq_exporter processes ..."
-pkill -f rabbitmq_exporter 2>/dev/null || true
-sleep 2
-
 info "Stopping service ..."
 systemctl stop rabbitmq_exporter 2>/dev/null || true
+systemctl disable rabbitmq_exporter 2>/dev/null || true
 sleep 2
-success "Cleanup done"
+success "Service stopped"
 
 # =============================================================================
-# STEP 3 — Restart RabbitMQ cleanly
+# STEP 2 — Clean temp files
 # =============================================================================
-echo ""
-echo -e "${BOLD}${CYAN}━━━  RESTART RABBITMQ  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-
-info "Restarting RabbitMQ server ..."
-systemctl restart rabbitmq-server
-sleep 6
-
-info "Re-enabling management plugin ..."
-rabbitmq-plugins enable rabbitmq_management
-sleep 4
-
-info "Checking RabbitMQ status ..."
-systemctl is-active rabbitmq-server \
-    && success "RabbitMQ is running" \
-    || { error "RabbitMQ not running"; journalctl -u rabbitmq-server -n 20 --no-pager; exit 1; }
+info "Cleaning old temp files ..."
+rm -f /tmp/rabbitmq_exporter*.tar.gz
+rm -rf /tmp/rabbitmq_exporter-*
+rm -f "${EXPORTER_BINARY}"
+success "Cleaned"
 
 # =============================================================================
-# STEP 4 — Fix admin user
+# STEP 3 — Download fresh binary
 # =============================================================================
-echo ""
-echo -e "${BOLD}${CYAN}━━━  FIX ADMIN USER  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
+info "Downloading rabbitmq_exporter v${VERSION} ..."
 
-info "Waiting for RabbitMQ to be fully ready ..."
-for i in $(seq 1 15); do
-    if rabbitmqctl status > /dev/null 2>&1; then
-        success "RabbitMQ is ready"
-        break
-    fi
-    echo "  waiting ... ${i}/15"
-    sleep 3
-done
+TARBALL="rabbitmq_exporter-${VERSION}.linux-amd64.tar.gz"
+URL="https://github.com/kbudde/rabbitmq_exporter/releases/download/v${VERSION}/${TARBALL}"
 
-info "Setting up admin user ..."
-rabbitmqctl delete_user guest 2>/dev/null || true
-rabbitmqctl add_user "${RMQ_USER}" "${RMQ_PASS}" 2>/dev/null \
-    || rabbitmqctl change_password "${RMQ_USER}" "${RMQ_PASS}"
-rabbitmqctl set_user_tags "${RMQ_USER}" administrator
-rabbitmqctl set_permissions -p "/" "${RMQ_USER}" ".*" ".*" ".*"
-success "Admin user ready"
+cd /tmp
+wget -q --show-progress -O "${TARBALL}" "${URL}" \
+    || error "Download failed"
 
-info "Waiting for management API ..."
-for i in $(seq 1 20); do
-    CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-        -u "${RMQ_USER}:${RMQ_PASS}" \
-        http://localhost:15672/api/overview 2>/dev/null || echo "000")
-    if [[ "${CODE}" == "200" ]]; then
-        success "Management API ready (HTTP 200)"
-        break
-    fi
-    echo "  attempt ${i}/20 — HTTP ${CODE}"
-    sleep 3
-done
+info "Download complete. Verifying ..."
+ls -lh "/tmp/${TARBALL}"
+file "/tmp/${TARBALL}"
 
 # =============================================================================
-# STEP 5 — Test binary directly before starting service
+# STEP 4 — Extract and install binary
 # =============================================================================
-echo ""
-echo -e "${BOLD}${CYAN}━━━  TEST BINARY DIRECTLY  ━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
+info "Extracting ..."
+tar -xzf "${TARBALL}" -C /tmp/
 
-info "Running exporter binary directly for 8 seconds ..."
-RABBIT_URL="http://localhost:15672" \
-RABBIT_USER="${RMQ_USER}" \
-RABBIT_PASSWORD="${RMQ_PASS}" \
-PUBLISH_PORT="${EXPORTER_PORT}" \
-RABBIT_CAPABILITIES="bert,no_sort" \
-RABBIT_EXPORTERS="exchange,node,overview,queue" \
-OUTPUT_FORMAT="TTY" \
-LOG_LEVEL="info" \
-timeout 8 "${EXPORTER_BINARY}" &
+info "Looking for binary ..."
+BINARY_PATH=$(find /tmp -name "rabbitmq_exporter" -type f 2>/dev/null | head -1)
+echo "  Found at: ${BINARY_PATH}"
 
-EXPORTER_PID=$!
-sleep 5
+[[ -z "${BINARY_PATH}" ]] && error "Binary not found after extraction"
 
-info "Testing metrics while binary runs directly ..."
-DIRECT_TEST=$(curl -sf "http://localhost:${EXPORTER_PORT}/metrics" 2>/dev/null || echo "FAILED")
+info "Installing to ${EXPORTER_BINARY} ..."
+cp "${BINARY_PATH}" "${EXPORTER_BINARY}"
+chmod 755 "${EXPORTER_BINARY}"
+chown root:root "${EXPORTER_BINARY}"
 
-if echo "${DIRECT_TEST}" | grep -q "rabbitmq_"; then
-    success "Binary works fine when run directly ✅"
-    BINARY_OK=true
-else
-    warn "Binary test result: ${DIRECT_TEST:0:100}"
-    BINARY_OK=false
-fi
+success "Binary installed"
 
-kill ${EXPORTER_PID} 2>/dev/null || true
-sleep 2
+info "Verify binary exists:"
+ls -la "${EXPORTER_BINARY}"
+file "${EXPORTER_BINARY}"
 
 # =============================================================================
-# STEP 6 — Rewrite systemd service
+# STEP 5 — Test binary directly
 # =============================================================================
-echo ""
-echo -e "${BOLD}${CYAN}━━━  REWRITE SYSTEMD SERVICE  ━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
+info "Testing binary directly ..."
+"${EXPORTER_BINARY}" --help > /dev/null 2>&1 \
+    && success "Binary runs correctly ✅" \
+    || error "Binary still cannot run"
 
-info "Writing new service file (running as root to avoid permission issues) ..."
+# =============================================================================
+# STEP 6 — Clean temp
+# =============================================================================
+rm -f "/tmp/${TARBALL}"
+rm -rf /tmp/rabbitmq_exporter-*
+success "Temp files cleaned"
+
+# =============================================================================
+# STEP 7 — Rewrite and start service
+# =============================================================================
+info "Writing systemd service ..."
 cat > /etc/systemd/system/rabbitmq_exporter.service << EOF
 [Unit]
 Description=RabbitMQ Prometheus Exporter
@@ -195,9 +115,8 @@ Wants=rabbitmq-server.service
 User=root
 Group=root
 Type=simple
-Restart=always
+Restart=on-failure
 RestartSec=10s
-TimeoutStartSec=60
 
 Environment="RABBIT_URL=http://localhost:15672"
 Environment="RABBIT_USER=${RMQ_USER}"
@@ -208,7 +127,6 @@ Environment="RABBIT_EXPORTERS=exchange,node,overview,queue"
 Environment="OUTPUT_FORMAT=TTY"
 Environment="LOG_LEVEL=info"
 
-ExecStartPre=/bin/sleep 5
 ExecStart=${EXPORTER_BINARY}
 StandardOutput=journal
 StandardError=journal
@@ -218,20 +136,25 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-success "Service file updated"
-
-info "Starting rabbitmq_exporter service ..."
+systemctl enable rabbitmq_exporter
 systemctl start rabbitmq_exporter
-sleep 8
+sleep 5
 
-info "Service status:"
-systemctl status rabbitmq_exporter --no-pager -l | head -15
+if systemctl is-active --quiet rabbitmq_exporter; then
+    success "rabbitmq_exporter service running ✅"
+else
+    echo ""
+    journalctl -u rabbitmq_exporter -n 20 --no-pager
+    error "Service still failing — see logs above"
+fi
+
+# =============================================================================
+# STEP 8 — Final tests
+# =============================================================================
 echo ""
-
-# =============================================================================
-# STEP 7 — Final verification
-# =============================================================================
-echo -e "${BOLD}${CYAN}━━━  FINAL VERIFICATION  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}  FINAL TESTS                                     ${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
 echo ""
 
 PASS=0; FAIL=0
@@ -248,15 +171,15 @@ check() {
     fi
 }
 
-check "rabbitmq-server active"    "systemctl is-active rabbitmq-server"    "active"
-check "rabbitmq_exporter active"  "systemctl is-active rabbitmq_exporter"  "active"
-check "Port 5672  listening"      "ss -tlnp | grep ':5672'"                "5672"
-check "Port 15672 listening"      "ss -tlnp | grep ':15672'"               "15672"
-check "Port 9419  listening"      "ss -tlnp | grep ':9419'"                "9419"
-check "Management API health"     "curl -sf -u ${RMQ_USER}:${RMQ_PASS} http://localhost:15672/api/healthchecks/node" "ok"
-check "Exporter /metrics working" "curl -sf http://localhost:${EXPORTER_PORT}/metrics" "rabbitmq_"
-check "Queue metrics present"     "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_queue" "rabbitmq_queue"
-check "Node metrics present"      "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_node"  "rabbitmq_node"
+check "rabbitmq-server active"   "systemctl is-active rabbitmq-server"   "active"
+check "rabbitmq_exporter active" "systemctl is-active rabbitmq_exporter" "active"
+check "Port 5672  listening"     "ss -tlnp | grep ':5672'"               "5672"
+check "Port 15672 listening"     "ss -tlnp | grep ':15672'"              "15672"
+check "Port 9419  listening"     "ss -tlnp | grep ':9419'"               "9419"
+check "Management API health"    "curl -sf -u ${RMQ_USER}:${RMQ_PASS} http://localhost:15672/api/healthchecks/node" "ok"
+check "Exporter metrics working" "curl -sf http://localhost:${EXPORTER_PORT}/metrics"                               "rabbitmq_"
+check "Queue metrics present"    "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_queue"         "rabbitmq_queue"
+check "Node metrics present"     "curl -sf http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_node"          "rabbitmq_node"
 
 MCOUNT=$(curl -sf "http://localhost:${EXPORTER_PORT}/metrics" \
     | grep -v "^#" | wc -l 2>/dev/null || echo "0")
@@ -270,16 +193,12 @@ echo ""
 
 if [[ ${FAIL} -eq 0 ]]; then
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}${BOLD}║      ALL FIXED — RabbitMQ Exporter Ready  🐇        ║${NC}"
+    echo -e "${GREEN}${BOLD}║      ALL DONE — RabbitMQ Exporter Ready  🐇         ║${NC}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 else
-    echo -e "${YELLOW}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${YELLOW}${BOLD}║      STILL ISSUES — Collect logs below              ║${NC}"
-    echo -e "${YELLOW}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo -e "  ${BOLD}Run these and share output:${NC}"
-    echo -e "    journalctl -u rabbitmq_exporter -n 30 --no-pager"
-    echo -e "    journalctl -u rabbitmq-server -n 30 --no-pager"
+    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}║      STILL ISSUES — Share output above              ║${NC}"
+    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 fi
 
 echo ""
