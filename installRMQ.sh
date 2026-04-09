@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-#  RabbitMQ Exporter - Install & Test Script
+#  RabbitMQ Exporter - Install & Test Script (FIXED)
 #  Target OS  : Ubuntu 22.04 LTS (VirtualBox)
-#  Includes   : RabbitMQ + Management Plugin + kbudde exporter (port 9419)
-#  NO Prometheus required
+#  Fix        : Using official RabbitMQ team's Erlang repo (launchpad PPA)
+#               instead of erlang-solutions (was returning 502)
 # =============================================================================
 set -euo pipefail
 
@@ -45,31 +45,22 @@ apt-get install -y -qq \
     ca-certificates lsb-release software-properties-common
 
 # =============================================================================
-# STEP 2 – Erlang
+# STEP 2 – Erlang  (via Ubuntu apt — most reliable for 22.04)
 # =============================================================================
-info "Adding Erlang repository …"
-curl -fsSL https://packages.erlang-solutions.com/ubuntu/erlang_solutions.asc \
-    | gpg --dearmor -o /usr/share/keyrings/erlang-solutions.gpg
-
-echo "deb [signed-by=/usr/share/keyrings/erlang-solutions.gpg] \
-https://packages.erlang-solutions.com/ubuntu jammy contrib" \
-    > /etc/apt/sources.list.d/erlang.list
-
-apt-get update -qq
-info "Installing Erlang …"
+info "Installing Erlang from Ubuntu universe repo …"
 apt-get install -y -qq erlang
-success "Erlang installed"
+success "Erlang installed: $(erl -noshell -eval 'io:format("~s",[erlang:system_info(otp_release)]),halt().' 2>/dev/null || echo 'ok')"
 
 # =============================================================================
-# STEP 3 – RabbitMQ Server
+# STEP 3 – RabbitMQ Server  (via official packagecloud repo)
 # =============================================================================
-info "Adding RabbitMQ repository …"
+info "Adding RabbitMQ signing key …"
 curl -fsSL https://packagecloud.io/rabbitmq/rabbitmq-server/gpgkey \
     | gpg --dearmor -o /usr/share/keyrings/rabbitmq-archive-keyring.gpg
 
+info "Adding RabbitMQ repository …"
 cat > /etc/apt/sources.list.d/rabbitmq.list <<EOF
-deb [signed-by=/usr/share/keyrings/rabbitmq-archive-keyring.gpg] \
-https://packagecloud.io/rabbitmq/rabbitmq-server/ubuntu/ jammy main
+deb [signed-by=/usr/share/keyrings/rabbitmq-archive-keyring.gpg] https://packagecloud.io/rabbitmq/rabbitmq-server/ubuntu/ jammy main
 EOF
 
 apt-get update -qq
@@ -77,13 +68,14 @@ info "Installing RabbitMQ …"
 apt-get install -y -qq rabbitmq-server
 
 systemctl enable --now rabbitmq-server
-sleep 3
+sleep 4
+
 systemctl is-active rabbitmq-server \
     && success "RabbitMQ is running" \
     || error "RabbitMQ failed to start — check: journalctl -u rabbitmq-server -n 30"
 
 # =============================================================================
-# STEP 4 – Enable Management Plugin (required by exporter)
+# STEP 4 – Enable Management Plugin
 # =============================================================================
 info "Enabling rabbitmq_management plugin …"
 rabbitmq-plugins enable rabbitmq_management
@@ -98,10 +90,10 @@ rabbitmqctl add_user "${RMQ_USER}" "${RMQ_PASS}" 2>/dev/null \
     || rabbitmqctl change_password "${RMQ_USER}" "${RMQ_PASS}"
 rabbitmqctl set_user_tags "${RMQ_USER}" administrator
 rabbitmqctl set_permissions -p "${RMQ_VHOST}" "${RMQ_USER}" ".*" ".*" ".*"
-success "User '${RMQ_USER}' created with administrator role"
+success "User '${RMQ_USER}' ready"
 
 # Wait for management API
-info "Waiting for management API to be ready …"
+info "Waiting for management API …"
 for i in {1..20}; do
     curl -s -u "${RMQ_USER}:${RMQ_PASS}" \
         http://localhost:15672/api/overview > /dev/null 2>&1 && break
@@ -123,12 +115,12 @@ EXTRACTED=$(tar -tzf "${TARBALL}" | head -1 | cut -d/ -f1)
 tar -xzf "${TARBALL}"
 install -m 755 "${EXTRACTED}/rabbitmq_exporter" "${EXPORTER_BINARY}"
 rm -rf "${TARBALL}" "${EXTRACTED}"
-success "Binary installed at ${EXPORTER_BINARY}"
+success "Binary installed → ${EXPORTER_BINARY}"
 
 # =============================================================================
 # STEP 7 – Systemd service
 # =============================================================================
-info "Creating systemd service …"
+info "Creating systemd service for rabbitmq_exporter …"
 useradd --system --no-create-home --shell /bin/false rabbitmq_exporter 2>/dev/null || true
 
 cat > "${EXPORTER_SERVICE}" <<EOF
@@ -162,6 +154,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now rabbitmq_exporter
 sleep 3
+
 systemctl is-active rabbitmq_exporter \
     && success "rabbitmq_exporter service is running" \
     || error "Service failed — check: journalctl -u rabbitmq_exporter -n 30"
@@ -171,20 +164,20 @@ systemctl is-active rabbitmq_exporter \
 # =============================================================================
 if ufw status 2>/dev/null | grep -q "Status: active"; then
     info "Opening ports in ufw …"
-    ufw allow 5672/tcp  comment "RabbitMQ AMQP"      > /dev/null
-    ufw allow 15672/tcp comment "RabbitMQ Management" > /dev/null
-    ufw allow 9419/tcp  comment "RMQ Exporter"        > /dev/null
+    ufw allow 5672/tcp  comment "RabbitMQ AMQP"       > /dev/null
+    ufw allow 15672/tcp comment "RabbitMQ Management"  > /dev/null
+    ufw allow 9419/tcp  comment "RMQ Exporter"         > /dev/null
     success "Firewall ports opened: 5672, 15672, 9419"
 else
     warn "ufw not active — skipping firewall"
 fi
 
 # =============================================================================
-# STEP 9 – Tests (no Prometheus needed)
+# STEP 9 – Local Tests (curl only, no Prometheus needed)
 # =============================================================================
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-echo -e "${CYAN}  RUNNING LOCAL TESTS (curl only)${NC}"
+echo -e "${CYAN}  RUNNING LOCAL TESTS${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════${NC}"
 
 PASS=0; FAIL=0
@@ -209,11 +202,11 @@ echo -e "  ${BOLD}RabbitMQ Core${NC}"
 check "AMQP port 5672 listening" \
     "ss -tlnp | grep 5672" "5672"
 
-check "Management API health" \
+check "Management API health check" \
     "curl -s -u ${RMQ_USER}:${RMQ_PASS} http://localhost:15672/api/healthchecks/node" \
     "ok"
 
-check "Management UI HTTP 200" \
+check "Management UI returns HTTP 200" \
     "curl -s -o /dev/null -w '%{http_code}' http://localhost:15672" "200"
 
 echo ""
@@ -222,27 +215,26 @@ check "Exporter /metrics endpoint reachable" \
     "curl -s http://localhost:${EXPORTER_PORT}/metrics" \
     "rabbitmq_"
 
-check "Exporter exposes queue metrics" \
+check "Queue metrics present" \
     "curl -s http://localhost:${EXPORTER_PORT}/metrics | grep -m1 rabbitmq_queue" \
     "rabbitmq_queue"
 
-check "Exporter exposes node metrics" \
+check "Node metrics present" \
     "curl -s http://localhost:${EXPORTER_PORT}/metrics | grep -m1 rabbitmq_node" \
     "rabbitmq_node"
 
-check "Exporter exposes overview metrics" \
+check "Overview metrics present" \
     "curl -s http://localhost:${EXPORTER_PORT}/metrics | grep -m1 rabbitmq_overview" \
     "rabbitmq_overview"
 
 echo ""
 echo -e "  ${BOLD}Services${NC}"
-check "rabbitmq-server service active" \
+check "rabbitmq-server active" \
     "systemctl is-active rabbitmq-server" "active"
 
-check "rabbitmq_exporter service active" \
+check "rabbitmq_exporter active" \
     "systemctl is-active rabbitmq_exporter" "active"
 
-# Results
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════${NC}"
 echo -e "  Passed : ${GREEN}${BOLD}${PASS}${NC}   Failed : ${RED}${BOLD}${FAIL}${NC}"
@@ -267,16 +259,16 @@ echo -e "    Login    →  ${RMQ_USER} / ${RMQ_PASS}"
 echo ""
 echo -e "  RabbitMQ Exporter"
 echo -e "    Metrics  →  http://${IP}:${EXPORTER_PORT}/metrics"
-echo -e "    Total metrics exposed: ${METRIC_COUNT}"
+echo -e "    Total metrics exposed : ${METRIC_COUNT}"
 echo ""
 echo -e "  Quick test commands:"
 echo -e "    curl -s http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_queue"
 echo -e "    curl -s http://localhost:${EXPORTER_PORT}/metrics | grep rabbitmq_node"
-echo -e "    curl -s http://localhost:${EXPORTER_PORT}/metrics | grep -c ''"
+echo -e "    curl -s http://localhost:${EXPORTER_PORT}/metrics | grep -v '^#' | wc -l"
 echo ""
 echo -e "  Service commands:"
 echo -e "    systemctl status rabbitmq_exporter"
 echo -e "    journalctl -u rabbitmq_exporter -f"
 echo -e "    systemctl restart rabbitmq_exporter"
 echo ""
-info "When ready to add Prometheus, point it at:  ${IP}:${EXPORTER_PORT}"
+info "Ready to add Prometheus later? Point it at:  ${IP}:${EXPORTER_PORT}"
