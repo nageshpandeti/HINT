@@ -1,5 +1,5 @@
 ---
-- name: Kong API Gateway - Install and Test
+- name: Kong API Gateway - Configure and Test Existing Install
   hosts: localhost
   connection: local
   become: true
@@ -42,17 +42,7 @@
       changed_when: false
       failed_when: false
 
-    - name: Remove old Kong repo files
-      shell: |
-        rm -f /etc/apt/sources.list.d/kong*.list
-        rm -f /etc/apt/sources.list.d/kong*.sources
-        rm -f /usr/share/keyrings/kong-archive-keyring.gpg
-      args:
-        executable: /bin/bash
-      changed_when: false
-      failed_when: false
-
-    - name: Apt update
+    - name: Update apt cache
       apt:
         update_cache: yes
       changed_when: false
@@ -62,15 +52,24 @@
       apt:
         name:
           - curl
-          - gnupg
-          - apt-transport-https
-          - ca-certificates
-          - lsb-release
+          - python3
           - python3-psycopg2
           - postgresql
           - postgresql-contrib
+          - psmisc
         state: present
         update_cache: yes
+
+    - name: Detect Kong binary
+      command: which kong
+      register: kong_bin
+      changed_when: false
+      failed_when: kong_bin.rc != 0
+
+    - name: Show Kong version
+      command: "{{ kong_bin.stdout }} version"
+      register: kong_ver
+      changed_when: false
 
     - name: Start and enable PostgreSQL
       service:
@@ -183,41 +182,7 @@
         return_content: yes
       register: mock_check
 
-    - name: Add Kong GPG key
-      shell: |
-        curl -fsSL https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key \
-          | gpg --dearmor -o /usr/share/keyrings/kong-archive-keyring.gpg
-      args:
-        executable: /bin/bash
-        creates: /usr/share/keyrings/kong-archive-keyring.gpg
-
-    - name: Add Kong repo
-      copy:
-        dest: /etc/apt/sources.list.d/kong-gateway-39.list
-        content: |
-          deb [signed-by=/usr/share/keyrings/kong-archive-keyring.gpg] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
-
-    - name: Update apt after adding Kong repo
-      apt:
-        update_cache: yes
-      changed_when: false
-
-    - name: Install Kong
-      apt:
-        name: kong
-        state: present
-
-    - name: Detect Kong binary
-      command: which kong
-      register: kong_bin
-      changed_when: false
-
-    - name: Show Kong version
-      command: kong version
-      register: kong_ver
-      changed_when: false
-
-    - name: Copy default kong.conf
+    - name: Copy default kong.conf if missing
       copy:
         src: /etc/kong/kong.conf.default
         dest: "{{ kong_conf }}"
@@ -286,10 +251,10 @@
       systemd:
         daemon_reload: true
 
-    - name: Start and enable Kong
+    - name: Restart and enable Kong
       systemd:
         name: kong
-        state: started
+        state: restarted
         enabled: true
 
     - name: Wait for Kong Admin API
