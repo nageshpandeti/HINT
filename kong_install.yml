@@ -37,14 +37,20 @@
         rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
         rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock
         dpkg --configure -a || true
+      args:
+        executable: /bin/bash
       changed_when: false
+      failed_when: false
 
     - name: Remove old Kong repo files
       shell: |
         rm -f /etc/apt/sources.list.d/kong*.list
         rm -f /etc/apt/sources.list.d/kong*.sources
         rm -f /usr/share/keyrings/kong-archive-keyring.gpg
+      args:
+        executable: /bin/bash
       changed_when: false
+      failed_when: false
 
     - name: Apt update
       apt:
@@ -78,36 +84,42 @@
         port: 5432
         timeout: 30
 
-    - name: Create Kong DB user
+    - name: Create Kong DB user if missing
       shell: |
         su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{{ pg_user }}'\"" | grep -q 1 || \
         su - postgres -c "psql -c \"CREATE USER {{ pg_user }} WITH PASSWORD '{{ pg_password }}' CREATEDB LOGIN;\""
       args:
         executable: /bin/bash
-      register: create_user
-      changed_when: create_user.rc == 0
+      changed_when: false
+      failed_when: false
 
-    - name: Create Kong database
+    - name: Create Kong database if missing
       shell: |
         su - postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='{{ pg_db }}'\"" | grep -q 1 || \
         su - postgres -c "psql -c \"CREATE DATABASE {{ pg_db }} OWNER {{ pg_user }} ENCODING 'UTF8';\""
       args:
         executable: /bin/bash
-      register: create_db
-      changed_when: create_db.rc == 0
+      changed_when: false
+      failed_when: false
 
     - name: Grant DB privileges
       shell: |
         su - postgres -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE {{ pg_db }} TO {{ pg_user }};\""
+      args:
+        executable: /bin/bash
       changed_when: false
+      failed_when: false
 
     - name: Kill old mock backend processes
       shell: |
-        pkill -f /tmp/mock_server.py 2>/dev/null || true
-        fuser -k {{ mock_port }}/tcp 2>/dev/null || true
+        pkill -f /tmp/mock_server.py || true
+        fuser -k {{ mock_port }}/tcp || true
         rm -f /tmp/mock_server.pid /tmp/mock_server.log
         sleep 2
+      args:
+        executable: /bin/bash
       changed_when: false
+      failed_when: false
 
     - name: Create mock server script
       copy:
@@ -176,6 +188,7 @@
         curl -fsSL https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key \
           | gpg --dearmor -o /usr/share/keyrings/kong-archive-keyring.gpg
       args:
+        executable: /bin/bash
         creates: /usr/share/keyrings/kong-archive-keyring.gpg
 
     - name: Add Kong repo
@@ -215,7 +228,10 @@
     - name: Remove old Ansible-managed block
       shell: |
         sed -i '/# BEGIN ANSIBLE MANAGED BLOCK/,/# END ANSIBLE MANAGED BLOCK/d' {{ kong_conf }} || true
+      args:
+        executable: /bin/bash
       changed_when: false
+      failed_when: false
 
     - name: Configure kong.conf
       blockinfile:
