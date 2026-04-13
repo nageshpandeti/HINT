@@ -1,14 +1,17 @@
 ---
 # ============================================================
 # Kong API Gateway — Complete Single-File Ansible Playbook
-# Ubuntu 22.04 (Jammy) — apt shell + lock fixes applied
+# Ubuntu 22.04 (Jammy)
+# Fixes applied:
+#   1. Removes broken RabbitMQ/third-party PPAs before apt update
+#   2. Fixed Jinja2 last() filter (was passing wrong args)
+#   3. All apt via shell to bypass Ansible apt module lock issues
 # ============================================================
 #
-# STEP 0 — Run in terminal BEFORE playbook (clears apt locks):
+# STEP 0 — Run in terminal BEFORE playbook:
 #
-#   sudo killall apt apt-get unattended-upgrades 2>/dev/null; true
-#   sudo rm -f /var/lib/dpkg/lock* /var/lib/apt/lists/lock /var/cache/apt/archives/lock
-#   sudo dpkg --configure -a
+#   sudo rm -f /etc/apt/sources.list.d/rabbitmq*.list*
+#   sudo rm -f /etc/apt/sources.list.d/ppa*.list*
 #   sudo apt-get update
 #
 # STEP 1 — Run the playbook:
@@ -45,6 +48,7 @@
     route_path:        /test-api
     test_api_key:      "my-local-test-key-2024"
 
+  # ============================================================
   pre_tasks:
 
     - name: Assert Ubuntu
@@ -58,17 +62,17 @@
         msg: "Ubuntu {{ ansible_distribution_version }} ({{ ansible_distribution_release }}) | RAM {{ ansible_memtotal_mb }}MB"
       tags: always
 
-    # ── Kill background apt processes ──────────────────────────
-    - name: "PRE | Kill apt background processes"
+    # ── Kill background apt/dpkg ───────────────────────────────
+    - name: "PRE | Kill background apt processes"
       shell: |
         killall apt apt-get unattended-upgrades dpkg 2>/dev/null || true
         systemctl stop unattended-upgrades 2>/dev/null || true
-        sleep 3
+        sleep 2
       changed_when: false
       tags: always
 
     # ── Remove ALL lock files ──────────────────────────────────
-    - name: "PRE | Remove all apt/dpkg lock files"
+    - name: "PRE | Remove apt/dpkg lock files"
       shell: |
         rm -f /var/lib/dpkg/lock
         rm -f /var/lib/dpkg/lock-frontend
@@ -80,41 +84,53 @@
 
     # ── Repair dpkg ────────────────────────────────────────────
     - name: "PRE | Repair dpkg state"
-      shell: |
-        dpkg --configure -a 2>&1 || true
-        apt-get install -f -y 2>&1 || true
+      shell: dpkg --configure -a 2>&1 || true
       changed_when: false
       tags: always
 
-    # ── Back up any broken third-party sources ─────────────────
-    - name: "PRE | Back up non-Ubuntu apt source lists"
+    # ── FIX: Remove broken third-party PPAs (RabbitMQ etc.) ───
+    # This is the root cause of your apt update failure
+    - name: "PRE | Remove broken third-party apt sources"
       shell: |
+        echo "=== Removing broken PPAs ==="
+        # Remove RabbitMQ PPA (ppa1.rabbitmq.com was failing)
+        rm -f /etc/apt/sources.list.d/rabbitmq*.list
+        rm -f /etc/apt/sources.list.d/rabbitmq*.sources
+        rm -f /etc/apt/sources.list.d/rabbitmq*.list.bak
+
+        # Remove any other failing non-Ubuntu PPAs
         for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
           [ -f "$f" ] || continue
+          # keep Ubuntu/Canonical sources and already-created Kong sources
           fname=$(basename "$f")
-          if [[ "$fname" != *"ubuntu"* && "$fname" != *"jammy"* ]]; then
-            mv "$f" "${f}.bak" 2>/dev/null && echo "Backed up $f" || true
+          if [[ "$fname" == *"rabbitmq"* ]] || \
+             [[ "$fname" == *"ppa1"* ]] || \
+             [[ "$fname" == *"ppa2"* ]]; then
+            echo "Removing broken source: $f"
+            rm -f "$f"
           fi
         done
+        echo "=== Done removing broken PPAs ==="
       changed_when: false
       tags: always
 
-    # ── apt-get update via SHELL (avoids Ansible apt module bug) ─
-    - name: "PRE | Run apt-get update (shell)"
+    # ── apt update via shell ───────────────────────────────────
+    - name: "PRE | Run apt-get update"
       shell: |
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y 2>&1
+        apt-get update 2>&1
       register: apt_update_out
       changed_when: false
       failed_when: false
       tags: always
 
-    - name: "PRE | Last 8 lines of apt update output"
+    # FIX: Use [-5:] slice syntax — NOT last() with args
+    - name: "PRE | apt update output (last 5 lines)"
       debug:
-        msg: "{{ apt_update_out.stdout_lines | default([]) | last(8) }}"
+        msg: "{{ apt_update_out.stdout_lines[-5:] }}"
       tags: always
 
-    # ── Check network if apt update failed ────────────────────
+    # ── Network check ─────────────────────────────────────────
     - name: "PRE | Check internet connectivity"
       shell: curl -sI https://archive.ubuntu.com --max-time 8 | head -1
       register: net_check
@@ -124,20 +140,22 @@
 
     - name: "PRE | Network status"
       debug:
-        msg: "{{ net_check.stdout if net_check.stdout != '' else 'WARNING — Cannot reach archive.ubuntu.com. Check VM Network Adapter (NAT/Bridged) in VirtualBox settings!' }}"
+        msg: >-
+          {{ 'Internet OK: ' ~ net_check.stdout
+             if net_check.stdout != ''
+             else 'WARNING — No internet. Fix: VirtualBox -> Network -> Adapter 1 -> NAT' }}
       tags: always
 
-    - name: "PRE | Fail if apt update had critical error AND network is down"
+    - name: "PRE | Fail if no internet"
       fail:
         msg: |
-          apt-get update failed AND no internet.
-          FIX IN VIRTUALBOX: Settings -> Network -> Adapter 1 -> Attached to: NAT
-          Then restart the VM and re-run the playbook.
-      when:
-        - apt_update_out.rc != 0
-        - net_check.rc != 0
+          No internet access from the VM.
+          In VirtualBox: Settings -> Network -> Adapter 1 -> Attached to: NAT
+          Then restart VM and re-run.
+      when: net_check.rc != 0
       tags: always
 
+  # ============================================================
   tasks:
 
     # ==========================================================
@@ -153,9 +171,9 @@
       changed_when: "'0 newly installed' not in prereq_out.stdout"
       tags: [prereqs]
 
-    - name: "STEP 1 | Prereqs done"
+    - name: "STEP 1 | Prereqs result"
       debug:
-        msg: "{{ prereq_out.stdout_lines | default([]) | last(4) }}"
+        msg: "{{ prereq_out.stdout_lines[-3:] }}"
       tags: [prereqs]
 
     # ==========================================================
@@ -202,7 +220,7 @@
         state: present
       tags: [postgres]
 
-    - name: "STEP 2 | Grant privileges"
+    - name: "STEP 2 | Grant all privileges"
       become_user: postgres
       community.postgresql.postgresql_privs:
         db: "{{ pg_db }}"
@@ -236,7 +254,7 @@
     - name: "STEP 3 | apt update after Kong repo"
       shell: |
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y 2>&1
+        apt-get update 2>&1
       changed_when: false
       tags: [kong_install]
 
@@ -306,7 +324,7 @@
       tags: [migrate, start]
 
     # ==========================================================
-    # STEP 6 — SERVICE
+    # STEP 6 — SYSTEMD SERVICE
     # ==========================================================
     - name: "STEP 6 | Create Kong systemd unit"
       copy:
@@ -375,32 +393,60 @@
       tags: [start, test, summary]
 
     # ==========================================================
-    # STEP 8–11 — SERVICE / ROUTE / PLUGINS / CONSUMER
+    # STEP 8 — SERVICE
     # ==========================================================
     - name: "STEP 8 | Create service → {{ svc_url }}"
       uri:
         url: "{{ kong_admin_url }}/services"
         method: POST
         body_format: json
-        body: { name: "{{ svc_name }}", url: "{{ svc_url }}" }
+        body:
+          name: "{{ svc_name }}"
+          url: "{{ svc_url }}"
         status_code: [200, 201, 409]
+      register: svc_result
       tags: [test, setup]
 
+    - name: "STEP 8 | Service result"
+      debug:
+        msg: "'{{ svc_name }}' (HTTP {{ svc_result.status }})"
+      tags: [test, setup]
+
+    # ==========================================================
+    # STEP 9 — ROUTE
+    # ==========================================================
     - name: "STEP 9 | Create route {{ route_path }}"
       uri:
         url: "{{ kong_admin_url }}/services/{{ svc_name }}/routes"
         method: POST
         body_format: json
-        body: { name: test-route, paths: ["{{ route_path }}"], strip_path: false }
+        body:
+          name: test-route
+          paths:
+            - "{{ route_path }}"
+          strip_path: false
         status_code: [200, 201, 409]
+      register: route_result
       tags: [test, setup]
 
-    - name: "STEP 10 | Rate-Limiting plugin"
+    - name: "STEP 9 | Route result"
+      debug:
+        msg: "Route '{{ route_path }}' (HTTP {{ route_result.status }})"
+      tags: [test, setup]
+
+    # ==========================================================
+    # STEP 10 — PLUGINS
+    # ==========================================================
+    - name: "STEP 10 | Rate-Limiting plugin (10 req/min)"
       uri:
         url: "{{ kong_admin_url }}/services/{{ svc_name }}/plugins"
         method: POST
         body_format: json
-        body: { name: rate-limiting, config: { minute: 10, policy: local } }
+        body:
+          name: rate-limiting
+          config:
+            minute: 10
+            policy: local
         status_code: [200, 201, 409]
       tags: [test, plugins]
 
@@ -409,16 +455,24 @@
         url: "{{ kong_admin_url }}/services/{{ svc_name }}/plugins"
         method: POST
         body_format: json
-        body: { name: key-auth, config: { key_names: [apikey] } }
+        body:
+          name: key-auth
+          config:
+            key_names:
+              - apikey
         status_code: [200, 201, 409]
       tags: [test, plugins]
 
+    # ==========================================================
+    # STEP 11 — CONSUMER + KEY
+    # ==========================================================
     - name: "STEP 11 | Create consumer test-user"
       uri:
         url: "{{ kong_admin_url }}/consumers"
         method: POST
         body_format: json
-        body: { username: test-user }
+        body:
+          username: test-user
         status_code: [200, 201, 409]
       tags: [test, consumer]
 
@@ -427,7 +481,8 @@
         url: "{{ kong_admin_url }}/consumers/test-user/key-auth"
         method: POST
         body_format: json
-        body: { key: "{{ test_api_key }}" }
+        body:
+          key: "{{ test_api_key }}"
         status_code: [200, 201, 409]
       tags: [test, consumer]
 
@@ -438,15 +493,16 @@
       uri:
         url: "{{ kong_proxy_url }}{{ route_path }}/get"
         method: GET
-        headers: { apikey: "{{ test_api_key }}" }
+        headers:
+          apikey: "{{ test_api_key }}"
         status_code: 200
         timeout: 30
       register: e2e
       tags: [test, e2e]
 
-    - name: "STEP 12 | E2E result"
+    - name: "STEP 12 | E2E passed"
       debug:
-        msg: "PASSED — HTTP {{ e2e.status }} — proxied to {{ svc_url }}"
+        msg: "PASSED — HTTP {{ e2e.status }} — Kong proxied to {{ svc_url }}"
       tags: [test, e2e]
 
     - name: "STEP 12 | Unauthenticated (expect 401)"
@@ -478,14 +534,16 @@
           ║  Admin API  : http://localhost:{{ kong_admin_port }}
           ║  Manager UI : http://localhost:{{ kong_manager_port }}
           ╠═══════════════════════════════════════════════════════╣
-          ║  QUICK TEST COMMANDS                                 ║
+          ║  TEST COMMANDS                                       ║
           ║                                                      ║
+          ║  # Authenticated (expect 200)                        ║
           ║  curl -i http://localhost:8000/test-api/get \        ║
           ║       -H "apikey: my-local-test-key-2024"           ║
           ║                                                      ║
+          ║  # No key (expect 401)                               ║
           ║  curl -i http://localhost:8000/test-api/get          ║
-          ║  (no key → expect 401)                               ║
           ║                                                      ║
+          ║  # Admin health                                      ║
           ║  curl -s http://localhost:8001 | python3 -m json.tool║
           ║  systemctl status kong                               ║
           ╚═══════════════════════════════════════════════════════╝
