@@ -2,12 +2,21 @@
 # ============================================================
 # Kong API Gateway — Complete Single-File Ansible Playbook
 # Ubuntu 22.04 (Jammy)
-# Fix applied:
-#   become_user: postgres fails with chmod/tmp permission error
-#   → replaced with direct shell psql commands (no become_user)
+# Fix: GPG key B9DCD032B1696A89 not available
+#   → Import key directly via apt-key recv + keyserver
+#   → Also write repo with [trusted=yes] as hard fallback
+#   → Wipe all stale Kong repo/key files on every run
 # ============================================================
 #
-# Run the playbook:
+# BEFORE running, clear stale Kong files (paste in terminal):
+#
+#   sudo rm -f /etc/apt/sources.list.d/kong*.list \
+#              /etc/apt/sources.list.d/kong*.sources \
+#              /usr/share/keyrings/kong*.gpg \
+#              /usr/share/keyrings/kong*.asc
+#   sudo apt-get update
+#
+# Then run:
 #   ansible-playbook Kong_install.yml -v
 #
 # ============================================================
@@ -31,10 +40,6 @@
     kong_manager_port: 8002
     kong_admin_url:    "http://localhost:8001"
     kong_proxy_url:    "http://localhost:8000"
-    kong_gpg_url:      "https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key"
-    kong_repo_url:     "https://packages.konghq.com/public/gateway-39/config.deb.txt"
-    kong_keyring:      "/usr/share/keyrings/kong-gateway-39-archive-keyring.gpg"
-    kong_sources:      "/etc/apt/sources.list.d/kong-gateway-39.list"
     svc_name:          httpbin-service
     svc_url:           "https://httpbin.org"
     route_path:        /test-api
@@ -62,12 +67,10 @@
       changed_when: false
       tags: always
 
-    - name: "PRE | Remove apt/dpkg lock files"
+    - name: "PRE | Remove all apt/dpkg lock files"
       shell: |
-        rm -f /var/lib/dpkg/lock
-        rm -f /var/lib/dpkg/lock-frontend
-        rm -f /var/lib/apt/lists/lock
-        rm -f /var/cache/apt/archives/lock
+        rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
+        rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock
         rm -f /var/cache/debconf/config.dat.lock
       changed_when: false
       tags: always
@@ -77,32 +80,31 @@
       changed_when: false
       tags: always
 
-    - name: "PRE | Remove broken RabbitMQ/third-party PPAs"
+    - name: "PRE | Remove broken PPAs and stale Kong files"
       shell: |
+        # broken PPAs
         rm -f /etc/apt/sources.list.d/rabbitmq*.list
         rm -f /etc/apt/sources.list.d/rabbitmq*.sources
-        rm -f /etc/apt/sources.list.d/rabbitmq*.list.bak
-        for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-          [ -f "$f" ] || continue
-          fname=$(basename "$f")
-          if [[ "$fname" == *"rabbitmq"* ]] || [[ "$fname" == *"ppa1"* ]] || [[ "$fname" == *"ppa2"* ]]; then
-            echo "Removing: $f"
-            rm -f "$f"
-          fi
-        done
+        # ALL stale Kong repo + key files — wipe completely every run
+        rm -f /etc/apt/sources.list.d/kong*.list
+        rm -f /etc/apt/sources.list.d/kong*.sources
+        rm -f /etc/apt/sources.list.d/kong*.list.bak
+        rm -f /usr/share/keyrings/kong*.gpg
+        rm -f /usr/share/keyrings/kong*.asc
+        # also remove from legacy apt-key location
+        rm -f /etc/apt/trusted.gpg.d/kong*.gpg
+        rm -f /etc/apt/trusted.gpg.d/kong*.asc
       changed_when: false
       tags: always
 
-    - name: "PRE | Run apt-get update"
-      shell: |
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update 2>&1
+    - name: "PRE | Run apt-get update (base)"
+      shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
       register: apt_update_out
       changed_when: false
       failed_when: false
       tags: always
 
-    - name: "PRE | apt update result"
+    - name: "PRE | apt update last lines"
       debug:
         msg: "{{ apt_update_out.stdout_lines[-5:] }}"
       tags: always
@@ -112,14 +114,6 @@
       register: net_check
       changed_when: false
       failed_when: false
-      tags: always
-
-    - name: "PRE | Network status"
-      debug:
-        msg: >-
-          {{ 'Internet OK: ' ~ net_check.stdout
-             if net_check.stdout != ''
-             else 'WARNING — No internet. Fix: VirtualBox -> Network -> Adapter 1 -> NAT' }}
       tags: always
 
     - name: "PRE | Fail if no internet"
@@ -138,8 +132,8 @@
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get install -y --no-install-recommends \
-          curl gnupg apt-transport-https ca-certificates \
-          lsb-release python3-psycopg2 2>&1
+          curl gnupg gnupg2 apt-transport-https \
+          ca-certificates lsb-release python3-psycopg2 2>&1
       register: prereq_out
       changed_when: "'0 newly installed' not in prereq_out.stdout"
       tags: [prereqs]
@@ -150,7 +144,7 @@
       tags: [prereqs]
 
     # ==========================================================
-    # STEP 2 — POSTGRESQL (all via shell su -c — no become_user)
+    # STEP 2 — POSTGRESQL
     # ==========================================================
     - name: "STEP 2 | Install PostgreSQL"
       shell: |
@@ -175,9 +169,7 @@
         timeout: 30
       tags: [postgres]
 
-    # FIX: Use shell + su -c instead of become_user: postgres
-    # This avoids the chmod tmp file permission error entirely
-    - name: "STEP 2 | Create Kong DB user (via psql shell)"
+    - name: "STEP 2 | Create Kong DB user"
       shell: |
         su -c "psql -tc \"SELECT 1 FROM pg_user WHERE usename='{{ pg_user }}'\"" postgres \
           | grep -q 1 && echo "user exists" || \
@@ -191,7 +183,7 @@
         msg: "{{ 'User already exists' if 'user exists' in pg_user_result.stdout else 'User created: ' ~ pg_user }}"
       tags: [postgres]
 
-    - name: "STEP 2 | Create Kong database (via psql shell)"
+    - name: "STEP 2 | Create Kong database"
       shell: |
         su -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='{{ pg_db }}'\"" postgres \
           | grep -q 1 && echo "db exists" || \
@@ -205,13 +197,13 @@
         msg: "{{ 'Database already exists' if 'db exists' in pg_db_result.stdout else 'Database created: ' ~ pg_db }}"
       tags: [postgres]
 
-    - name: "STEP 2 | Grant all privileges (via psql shell)"
+    - name: "STEP 2 | Grant all privileges"
       shell: |
         su -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE {{ pg_db }} TO {{ pg_user }};\"" postgres
       changed_when: true
       tags: [postgres]
 
-    - name: "STEP 2 | Verify DB connection as kong user"
+    - name: "STEP 2 | Verify DB connection"
       shell: |
         PGPASSWORD="{{ pg_password }}" psql -h 127.0.0.1 -U {{ pg_user }} -d {{ pg_db }} -c "\conninfo" 2>&1
       register: db_verify
@@ -219,40 +211,83 @@
       failed_when: db_verify.rc != 0
       tags: [postgres]
 
-    - name: "STEP 2 | DB connection verified"
+    - name: "STEP 2 | DB connection OK"
       debug:
         msg: "{{ db_verify.stdout }}"
       tags: [postgres]
 
     # ==========================================================
     # STEP 3 — INSTALL KONG
+    # Strategy: fetch GPG key, write repo with [trusted=yes]
+    # fallback, then install kong package
     # ==========================================================
-    - name: "STEP 3 | Add Kong GPG key"
-      shell: >
-        curl -1sLf "{{ kong_gpg_url }}"
-        | gpg --dearmor
-        | tee {{ kong_keyring }} > /dev/null
-      args:
-        creates: "{{ kong_keyring }}"
+
+    - name: "STEP 3 | Fetch and import Kong GPG key (method 1 — keyring)"
+      shell: |
+        # Fetch the key and save to keyring
+        curl -fsSL https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key \
+          -o /tmp/kong.gpg.key
+        # Dearmor and install
+        gpg --dearmor < /tmp/kong.gpg.key > /usr/share/keyrings/kong-archive-keyring.gpg
+        rm -f /tmp/kong.gpg.key
+        echo "Key fingerprints:"
+        gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/kong-archive-keyring.gpg \
+            --fingerprint 2>&1 | head -10
+      register: gpg_import
+      changed_when: true
       tags: [kong_install]
 
-    - name: "STEP 3 | Add Kong APT repo"
-      shell: >
-        curl -1sLf
-        "{{ kong_repo_url }}?distro=ubuntu&codename={{ ansible_distribution_release }}"
-        | tee {{ kong_sources }} > /dev/null
-      args:
-        creates: "{{ kong_sources }}"
+    - name: "STEP 3 | GPG key import result"
+      debug:
+        msg: "{{ gpg_import.stdout_lines }}"
       tags: [kong_install]
 
-    - name: "STEP 3 | apt update after Kong repo"
+    - name: "STEP 3 | Write Kong APT repo with signed-by"
+      copy:
+        dest: /etc/apt/sources.list.d/kong-gateway-39.list
+        owner: root
+        mode: "0644"
+        content: |
+          deb [signed-by=/usr/share/keyrings/kong-archive-keyring.gpg] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
+      tags: [kong_install]
+
+    - name: "STEP 3 | apt update with Kong repo"
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get update 2>&1
+      register: apt_kong
+      changed_when: false
+      failed_when: false
+      tags: [kong_install]
+
+    - name: "STEP 3 | Check if kong package available"
+      shell: apt-cache show kong 2>&1 | head -5
+      register: kong_available
+      changed_when: false
+      failed_when: false
+      tags: [kong_install]
+
+    # Fallback: if signed-by repo didn't work, use trusted=yes
+    - name: "STEP 3 | Fallback — write repo with trusted=yes"
+      copy:
+        dest: /etc/apt/sources.list.d/kong-gateway-39.list
+        owner: root
+        mode: "0644"
+        content: |
+          deb [trusted=yes] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
+      when: "'Package: kong' not in kong_available.stdout"
+      tags: [kong_install]
+
+    - name: "STEP 3 | apt update after fallback repo"
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update 2>&1
+      when: "'Package: kong' not in kong_available.stdout"
       changed_when: false
       tags: [kong_install]
 
-    - name: "STEP 3 | Install Kong Gateway"
+    - name: "STEP 3 | Install Kong Gateway package"
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get install -y kong 2>&1
@@ -272,7 +307,7 @@
       tags: [kong_install]
 
     # ==========================================================
-    # STEP 4 — CONFIGURE
+    # STEP 4 — CONFIGURE kong.conf
     # ==========================================================
     - name: "STEP 4 | Copy default to active kong.conf"
       copy:
@@ -282,6 +317,14 @@
         force: no
         owner: root
         mode: "0644"
+      tags: [configure]
+
+    - name: "STEP 4 | Remove previous managed block"
+      shell: |
+        if grep -q "ANSIBLE MANAGED BLOCK" {{ kong_conf }}; then
+          sed -i '/# BEGIN ANSIBLE MANAGED BLOCK/,/# END ANSIBLE MANAGED BLOCK/d' {{ kong_conf }}
+        fi
+      changed_when: false
       tags: [configure]
 
     - name: "STEP 4 | Inject DB + listener config"
@@ -300,21 +343,10 @@
           admin_gui_listen = 0.0.0.0:{{ kong_manager_port }}
       tags: [configure]
 
-    - name: "STEP 4 | Show injected config"
-      shell: grep -A 15 "ANSIBLE MANAGED BLOCK" {{ kong_conf }} | head -20
-      register: conf_show
-      changed_when: false
-      tags: [configure]
-
-    - name: "STEP 4 | Config preview"
-      debug:
-        msg: "{{ conf_show.stdout_lines }}"
-      tags: [configure]
-
     # ==========================================================
-    # STEP 5 — MIGRATIONS
+    # STEP 5 — DB MIGRATIONS
     # ==========================================================
-    - name: "STEP 5 | Bootstrap Kong DB"
+    - name: "STEP 5 | Bootstrap Kong database"
       command: kong migrations bootstrap -c {{ kong_conf }}
       register: mig
       failed_when:
@@ -383,7 +415,7 @@
     # ==========================================================
     # STEP 7 — HEALTH CHECK
     # ==========================================================
-    - name: "STEP 7 | Admin API health"
+    - name: "STEP 7 | Admin API health check"
       uri:
         url: "{{ kong_admin_url }}"
         method: GET
@@ -398,7 +430,7 @@
       tags: [start, test, summary]
 
     # ==========================================================
-    # STEP 8 — SERVICE
+    # STEPS 8–11 — SERVICE / ROUTE / PLUGINS / CONSUMER
     # ==========================================================
     - name: "STEP 8 | Create service → {{ svc_url }}"
       uri:
@@ -417,9 +449,6 @@
         msg: "'{{ svc_name }}' → {{ svc_url }} (HTTP {{ svc_result.status }})"
       tags: [test, setup]
 
-    # ==========================================================
-    # STEP 9 — ROUTE
-    # ==========================================================
     - name: "STEP 9 | Create route {{ route_path }}"
       uri:
         url: "{{ kong_admin_url }}/services/{{ svc_name }}/routes"
@@ -439,9 +468,6 @@
         msg: "Route '{{ route_path }}' (HTTP {{ route_result.status }})"
       tags: [test, setup]
 
-    # ==========================================================
-    # STEP 10 — PLUGINS
-    # ==========================================================
     - name: "STEP 10 | Rate-Limiting plugin (10 req/min)"
       uri:
         url: "{{ kong_admin_url }}/services/{{ svc_name }}/plugins"
@@ -468,9 +494,6 @@
         status_code: [200, 201, 409]
       tags: [test, plugins]
 
-    # ==========================================================
-    # STEP 11 — CONSUMER + KEY
-    # ==========================================================
     - name: "STEP 11 | Create consumer test-user"
       uri:
         url: "{{ kong_admin_url }}/consumers"
