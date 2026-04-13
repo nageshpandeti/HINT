@@ -309,7 +309,7 @@
           name: test-route
           paths:
             - "{{ route_path }}"
-          strip_path: true
+          strip_path: false
         status_code: [200, 201]
       register: route_result
 
