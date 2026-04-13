@@ -3,41 +3,27 @@
 # Kong API Gateway — Complete Single-File Ansible Playbook
 # ============================================================
 #
-# ⚠️  FIX from previous error:
-#      OLD broken file had:  hosts: kong_servers  ← caused "no hosts matched"
-#      THIS file uses:       hosts: localhost      ← runs on THIS machine
-#                            connection: local     ← no SSH, no inventory needed
-#
 # STEP 0 — Prepare Ansible (run once):
 #
-#   sudo apt update && sudo apt install -y ansible python3-psycopg2
+#   sudo apt install -y ansible python3-psycopg2
 #   ansible-galaxy collection install community.postgresql
 #
 # STEP 1 — Run the full playbook:
 #
-#   ansible-playbook RUN_THIS_kong.yml -v
+#   ansible-playbook Kong_install.yml -v --ask-become-pass
 #
-# STEP 2 — Run specific steps only:
+#   (if your user already has passwordless sudo, just use -v)
+#   ansible-playbook Kong_install.yml -v
 #
-#   ansible-playbook RUN_THIS_kong.yml --tags prereqs
-#   ansible-playbook RUN_THIS_kong.yml --tags postgres
-#   ansible-playbook RUN_THIS_kong.yml --tags kong_install
-#   ansible-playbook RUN_THIS_kong.yml --tags configure
-#   ansible-playbook RUN_THIS_kong.yml --tags start
-#   ansible-playbook RUN_THIS_kong.yml --tags test
-#   ansible-playbook RUN_THIS_kong.yml --tags e2e
-#   ansible-playbook RUN_THIS_kong.yml --tags summary
 # ============================================================
 
 - name: Kong API Gateway — Install and Test
-  hosts: localhost        # runs on THIS machine, no inventory file needed
-  connection: local       # no SSH required
-  become: true            # uses sudo
+  hosts: localhost
+  connection: local
+  become: true
+  become_method: sudo
   gather_facts: true
 
-  # ----------------------------------------------------------
-  # ALL CONFIG — change values here if needed
-  # ----------------------------------------------------------
   vars:
     pg_user:           kong
     pg_password:       "KongSecret@2024"
@@ -59,7 +45,6 @@
     route_path:        /test-api
     test_api_key:      "my-local-test-key-2024"
 
-  # ----------------------------------------------------------
   pre_tasks:
     - name: Assert Ubuntu
       assert:
@@ -72,18 +57,43 @@
         msg: "Ubuntu {{ ansible_distribution_version }} ({{ ansible_distribution_release }}) | RAM {{ ansible_memtotal_mb }}MB"
       tags: always
 
-  # ----------------------------------------------------------
+    # ----------------------------------------------------------
+    # Kill any apt/dpkg locks before doing anything
+    # ----------------------------------------------------------
+    - name: "PRE | Kill any stale apt locks"
+      shell: |
+        # wait up to 60s for any running apt/dpkg to finish
+        for i in $(seq 1 12); do
+          if ! fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock > /dev/null 2>&1; then
+            break
+          fi
+          echo "Waiting for apt lock... attempt $i/12"
+          sleep 5
+        done
+        # forcibly remove stale lock files if they are still there and nothing holds them
+        rm -f /var/lib/dpkg/lock-frontend
+        rm -f /var/lib/dpkg/lock
+        rm -f /var/cache/apt/archives/lock
+        rm -f /var/lib/apt/lists/lock
+        dpkg --configure -a || true
+      changed_when: false
+      tags: always
+
+    - name: "PRE | apt update (clean)"
+      apt:
+        update_cache: yes
+        cache_valid_time: 0       # force fresh update
+      register: apt_update
+      retries: 3
+      delay: 10
+      until: apt_update is succeeded
+      tags: always
+
   tasks:
 
     # ==========================================================
     # STEP 1 — PREREQUISITES
     # ==========================================================
-    - name: "STEP 1 | apt update"
-      apt:
-        update_cache: yes
-        cache_valid_time: 3600
-      tags: [prereqs]
-
     - name: "STEP 1 | Install system dependencies"
       apt:
         name:
@@ -94,6 +104,7 @@
           - lsb-release
           - python3-psycopg2
         state: present
+        update_cache: no          # already done in pre_tasks
       tags: [prereqs]
 
     # ==========================================================
@@ -163,9 +174,13 @@
         creates: "{{ kong_sources }}"
       tags: [kong_install]
 
-    - name: "STEP 3 | apt update after new repo"
+    - name: "STEP 3 | apt update after Kong repo"
       apt:
         update_cache: yes
+      retries: 3
+      delay: 10
+      register: apt_kong_update
+      until: apt_kong_update is succeeded
       tags: [kong_install]
 
     - name: "STEP 3 | Install Kong Gateway OSS"
@@ -489,7 +504,6 @@
           ╚═══════════════════════════════════════════════════════════╝
       tags: [test, summary]
 
-  # ----------------------------------------------------------
   handlers:
     - name: reload systemd
       systemd:
