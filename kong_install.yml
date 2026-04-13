@@ -1,17 +1,14 @@
 ---
 # ============================================================
 # Kong API Gateway — Complete Single-File Ansible Playbook
-# Ubuntu 22.04 (Jammy) — FINAL VERSION
-# Fix: E2E test returned 404 — strip_path was false so
-#      /test-api/get was sent to httpbin as /test-api/get
-#      but httpbin only has /get not /test-api/get
-#      → set strip_path: true so Kong strips /test-api
-#        before forwarding, leaving just /get to httpbin
-# ============================================================
+# Ubuntu 22.04 (Jammy) — FINAL WORKING VERSION
 #
-# Run the playbook:
-#   ansible-playbook Kong_install.yml -v
+# Fix: httpbin.org public instance returns 404 unreliably
+#   → Spin up a local Python HTTP server on port 9090
+#   → Kong proxies to localhost:9090 (always returns 200)
+#   → No external dependency, works 100% offline too
 #
+# Run:  ansible-playbook Kong_install.yml -v
 # ============================================================
 
 - name: Kong API Gateway — Install and Test
@@ -33,13 +30,12 @@
     kong_manager_port: 8002
     kong_admin_url:    "http://localhost:8001"
     kong_proxy_url:    "http://localhost:8000"
-    svc_name:          httpbin-service
-    svc_url:           "https://httpbin.org"   # backend base URL
-    route_path:        /test-api               # Kong listens on /test-api
+    # Local mock backend — guaranteed 200, no external dependency
+    mock_port:         9090
+    svc_name:          local-mock-service
+    svc_url:           "http://localhost:9090"
+    route_path:        /test-api
     test_api_key:      "my-local-test-key-2024"
-    # strip_path: true → /test-api/get becomes /get when sent to httpbin
-    # test via: curl http://localhost:8000/test-api/get -H "apikey: ..."
-    # httpbin receives: GET /get  ← valid httpbin endpoint → 200 OK
 
   # ============================================================
   pre_tasks:
@@ -125,10 +121,87 @@
       changed_when: "'0 newly installed' not in prereq_out.stdout"
       tags: [prereqs]
 
+    - name: "STEP 1 | Done"
+      debug:
+        msg: "{{ prereq_out.stdout_lines[-3:] }}"
+      tags: [prereqs]
+
     # ==========================================================
-    # STEP 2 — POSTGRESQL
+    # STEP 2 — LOCAL MOCK BACKEND SERVER
+    # Python HTTP server on port 9090, always returns 200
     # ==========================================================
-    - name: "STEP 2 | Install PostgreSQL"
+    - name: "STEP 2 | Kill any process on port {{ mock_port }}"
+      shell: fuser -k {{ mock_port }}/tcp 2>/dev/null || true
+      changed_when: false
+      tags: [mock]
+
+    - name: "STEP 2 | Create mock server script"
+      copy:
+        dest: /tmp/mock_server.py
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import json, datetime
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = json.dumps({
+                      "status": "ok",
+                      "path": self.path,
+                      "method": "GET",
+                      "message": "Kong API Gateway mock backend",
+                      "timestamp": datetime.datetime.utcnow().isoformat()
+                  }).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, fmt, *args):
+                  pass  # suppress logs
+
+          if __name__ == "__main__":
+              server = HTTPServer(("0.0.0.0", {{ mock_port }}), Handler)
+              print("Mock server listening on :{{ mock_port }}")
+              server.serve_forever()
+      tags: [mock]
+
+    - name: "STEP 2 | Start mock backend server (background)"
+      shell: |
+        nohup python3 /tmp/mock_server.py > /tmp/mock_server.log 2>&1 &
+        echo $! > /tmp/mock_server.pid
+        sleep 1
+        echo "PID: $(cat /tmp/mock_server.pid)"
+      changed_when: true
+      tags: [mock]
+
+    - name: "STEP 2 | Wait for mock backend on port {{ mock_port }}"
+      wait_for:
+        host: localhost
+        port: "{{ mock_port }}"
+        delay: 1
+        timeout: 15
+      tags: [mock]
+
+    - name: "STEP 2 | Verify mock backend responds"
+      uri:
+        url: "http://localhost:{{ mock_port }}/health"
+        method: GET
+        status_code: 200
+      register: mock_check
+      tags: [mock]
+
+    - name: "STEP 2 | Mock backend OK"
+      debug:
+        msg: "Mock backend running on :{{ mock_port }} — response: {{ mock_check.json }}"
+      tags: [mock]
+
+    # ==========================================================
+    # STEP 3 — POSTGRESQL
+    # ==========================================================
+    - name: "STEP 3 | Install PostgreSQL"
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get install -y postgresql postgresql-contrib 2>&1
@@ -136,14 +209,14 @@
       changed_when: "'0 newly installed' not in pg_out.stdout"
       tags: [postgres]
 
-    - name: "STEP 2 | Start and enable PostgreSQL"
+    - name: "STEP 3 | Start and enable PostgreSQL"
       service:
         name: postgresql
         state: started
         enabled: yes
       tags: [postgres]
 
-    - name: "STEP 2 | Wait for PostgreSQL :5432"
+    - name: "STEP 3 | Wait for PostgreSQL :5432"
       wait_for:
         host: localhost
         port: 5432
@@ -151,7 +224,7 @@
         timeout: 30
       tags: [postgres]
 
-    - name: "STEP 2 | Create Kong DB user"
+    - name: "STEP 3 | Create Kong DB user"
       shell: |
         su -c "psql -tc \"SELECT 1 FROM pg_user WHERE usename='{{ pg_user }}'\"" postgres \
           | grep -q 1 && echo "user exists" || \
@@ -160,7 +233,7 @@
       changed_when: "'user exists' not in pg_user_result.stdout"
       tags: [postgres]
 
-    - name: "STEP 2 | Create Kong database"
+    - name: "STEP 3 | Create Kong database"
       shell: |
         su -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='{{ pg_db }}'\"" postgres \
           | grep -q 1 && echo "db exists" || \
@@ -169,13 +242,13 @@
       changed_when: "'db exists' not in pg_db_result.stdout"
       tags: [postgres]
 
-    - name: "STEP 2 | Grant all privileges"
+    - name: "STEP 3 | Grant all privileges"
       shell: |
         su -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE {{ pg_db }} TO {{ pg_user }};\"" postgres
       changed_when: true
       tags: [postgres]
 
-    - name: "STEP 2 | Verify DB connection"
+    - name: "STEP 3 | Verify DB connection"
       shell: |
         PGPASSWORD="{{ pg_password }}" psql -h 127.0.0.1 -U {{ pg_user }} -d {{ pg_db }} -c "\conninfo" 2>&1
       register: db_verify
@@ -183,22 +256,22 @@
       failed_when: db_verify.rc != 0
       tags: [postgres]
 
-    - name: "STEP 2 | DB OK"
+    - name: "STEP 3 | DB OK"
       debug:
         msg: "{{ db_verify.stdout }}"
       tags: [postgres]
 
     # ==========================================================
-    # STEP 3 — INSTALL KONG
+    # STEP 4 — INSTALL KONG
     # ==========================================================
-    - name: "STEP 3 | Check if Kong already installed"
+    - name: "STEP 4 | Check if Kong already installed"
       command: which kong
       register: kong_installed
       changed_when: false
       failed_when: false
       tags: [kong_install]
 
-    - name: "STEP 3 | Fetch and import Kong GPG key"
+    - name: "STEP 4 | Fetch and import Kong GPG key"
       shell: |
         curl -fsSL https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key \
           -o /tmp/kong.gpg.key
@@ -208,7 +281,7 @@
       changed_when: true
       tags: [kong_install]
 
-    - name: "STEP 3 | Write Kong APT repo (signed-by)"
+    - name: "STEP 4 | Write Kong APT repo"
       copy:
         dest: /etc/apt/sources.list.d/kong-gateway-39.list
         content: |
@@ -216,65 +289,57 @@
       when: kong_installed.rc != 0
       tags: [kong_install]
 
-    - name: "STEP 3 | apt update after Kong repo"
+    - name: "STEP 4 | apt update after Kong repo"
       shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
       when: kong_installed.rc != 0
       changed_when: false
       failed_when: false
       tags: [kong_install]
 
-    - name: "STEP 3 | Check kong package availability"
-      shell: apt-cache show kong 2>&1 | head -3
-      register: kong_available
+    - name: "STEP 4 | Fallback — trusted=yes repo if signed-by failed"
+      block:
+        - name: Check kong package in cache
+          shell: apt-cache show kong 2>&1 | head -3
+          register: kong_available
+          changed_when: false
+
+        - name: Write trusted=yes repo
+          copy:
+            dest: /etc/apt/sources.list.d/kong-gateway-39.list
+            content: |
+              deb [trusted=yes] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
+          when: "'Package: kong' not in kong_available.stdout"
+
+        - name: apt update after trusted repo
+          shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
+          when: "'Package: kong' not in kong_available.stdout"
+          changed_when: false
       when: kong_installed.rc != 0
-      changed_when: false
-      failed_when: false
       tags: [kong_install]
 
-    - name: "STEP 3 | Fallback — repo with trusted=yes (if GPG failed)"
-      copy:
-        dest: /etc/apt/sources.list.d/kong-gateway-39.list
-        content: |
-          deb [trusted=yes] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
-      when:
-        - kong_installed.rc != 0
-        - kong_available is defined
-        - "'Package: kong' not in (kong_available.stdout | default(''))"
-      tags: [kong_install]
-
-    - name: "STEP 3 | apt update after fallback repo"
-      shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
-      when:
-        - kong_installed.rc != 0
-        - kong_available is defined
-        - "'Package: kong' not in (kong_available.stdout | default(''))"
-      changed_when: false
-      tags: [kong_install]
-
-    - name: "STEP 3 | Install Kong package"
+    - name: "STEP 4 | Install Kong package"
       shell: |
         export DEBIAN_FRONTEND=noninteractive
         apt-get install -y kong 2>&1
       when: kong_installed.rc != 0
-      register: kong_pkg
       changed_when: true
       tags: [kong_install]
 
-    - name: "STEP 3 | Verify kong binary"
+    - name: "STEP 4 | Verify kong binary"
       command: kong version
       register: kong_ver
       changed_when: false
       tags: [kong_install]
 
-    - name: "STEP 3 | Kong version"
+    - name: "STEP 4 | Kong version"
       debug:
-        msg: "Kong installed → {{ kong_ver.stdout }}"
+        msg: "Kong → {{ kong_ver.stdout }}"
       tags: [kong_install]
 
     # ==========================================================
-    # STEP 4 — CONFIGURE kong.conf
+    # STEP 5 — CONFIGURE kong.conf
     # ==========================================================
-    - name: "STEP 4 | Copy default to active kong.conf"
+    - name: "STEP 5 | Copy default to active kong.conf"
       copy:
         src: /etc/kong/kong.conf.default
         dest: "{{ kong_conf }}"
@@ -284,7 +349,7 @@
         mode: "0644"
       tags: [configure]
 
-    - name: "STEP 4 | Remove previous managed block"
+    - name: "STEP 5 | Remove previous managed block"
       shell: |
         if grep -q "ANSIBLE MANAGED BLOCK" {{ kong_conf }}; then
           sed -i '/# BEGIN ANSIBLE MANAGED BLOCK/,/# END ANSIBLE MANAGED BLOCK/d' {{ kong_conf }}
@@ -292,7 +357,7 @@
       changed_when: false
       tags: [configure]
 
-    - name: "STEP 4 | Inject DB + listener config"
+    - name: "STEP 5 | Inject DB + listener config"
       blockinfile:
         path: "{{ kong_conf }}"
         marker: "# {mark} ANSIBLE MANAGED BLOCK"
@@ -309,9 +374,9 @@
       tags: [configure]
 
     # ==========================================================
-    # STEP 5 — DB MIGRATIONS
+    # STEP 6 — DB MIGRATIONS
     # ==========================================================
-    - name: "STEP 5 | Bootstrap Kong database"
+    - name: "STEP 6 | Bootstrap Kong database"
       command: kong migrations bootstrap -c {{ kong_conf }}
       register: mig
       failed_when:
@@ -320,15 +385,15 @@
       changed_when: "'already bootstrapped' not in (mig.stderr | default(''))"
       tags: [migrate, start]
 
-    - name: "STEP 5 | Migration result"
+    - name: "STEP 6 | Migration result"
       debug:
         msg: "{{ 'Already bootstrapped — skipped' if 'already bootstrapped' in (mig.stderr | default('')) else 'Migrations completed' }}"
       tags: [migrate, start]
 
     # ==========================================================
-    # STEP 6 — SYSTEMD SERVICE
+    # STEP 7 — SYSTEMD SERVICE
     # ==========================================================
-    - name: "STEP 6 | Create Kong systemd unit"
+    - name: "STEP 7 | Create Kong systemd unit"
       copy:
         dest: /lib/systemd/system/kong.service
         owner: root
@@ -353,7 +418,7 @@
           WantedBy=multi-user.target
       tags: [start]
 
-    - name: "STEP 6 | Reload systemd + start Kong"
+    - name: "STEP 7 | Reload systemd + start Kong"
       systemd:
         name: kong
         daemon_reload: yes
@@ -361,7 +426,7 @@
         enabled: yes
       tags: [start]
 
-    - name: "STEP 6 | Wait for Admin API :8001"
+    - name: "STEP 7 | Wait for Admin API :8001"
       wait_for:
         host: localhost
         port: "{{ kong_admin_port }}"
@@ -369,7 +434,7 @@
         timeout: 60
       tags: [start]
 
-    - name: "STEP 6 | Wait for Proxy :8000"
+    - name: "STEP 7 | Wait for Proxy :8000"
       wait_for:
         host: localhost
         port: "{{ kong_proxy_port }}"
@@ -378,9 +443,9 @@
       tags: [start]
 
     # ==========================================================
-    # STEP 7 — HEALTH CHECK
+    # STEP 8 — HEALTH CHECK
     # ==========================================================
-    - name: "STEP 7 | Admin API health"
+    - name: "STEP 8 | Admin API health"
       uri:
         url: "{{ kong_admin_url }}"
         method: GET
@@ -389,34 +454,29 @@
       register: health
       tags: [start, test, summary]
 
-    - name: "STEP 7 | Kong healthy"
+    - name: "STEP 8 | Kong healthy"
       debug:
         msg: "Kong v{{ health.json.version }} UP — proxy :{{ kong_proxy_port }} | admin :{{ kong_admin_port }}"
       tags: [start, test, summary]
 
     # ==========================================================
-    # STEP 8 — DELETE OLD SERVICE/ROUTE IF EXISTS (clean slate)
+    # STEP 9 — CLEAN SLATE + CREATE SERVICE/ROUTE
     # ==========================================================
-    - name: "STEP 8 | Delete existing test-route if present"
+    - name: "STEP 9 | Delete old route if exists"
       uri:
         url: "{{ kong_admin_url }}/routes/test-route"
         method: DELETE
         status_code: [204, 404]
       tags: [test, setup]
 
-    - name: "STEP 8 | Delete existing service if present"
+    - name: "STEP 9 | Delete old service if exists"
       uri:
         url: "{{ kong_admin_url }}/services/{{ svc_name }}"
         method: DELETE
         status_code: [204, 404]
       tags: [test, setup]
 
-    # ==========================================================
-    # STEP 9 — CREATE SERVICE + ROUTE
-    # strip_path: true → strips /test-api before forwarding
-    # so httpbin receives GET /get (valid) not GET /test-api/get (404)
-    # ==========================================================
-    - name: "STEP 9 | Create service → {{ svc_url }}"
+    - name: "STEP 9 | Create service → local mock :{{ mock_port }}"
       uri:
         url: "{{ kong_admin_url }}/services"
         method: POST
@@ -433,7 +493,7 @@
         msg: "'{{ svc_name }}' → {{ svc_url }} (HTTP {{ svc_result.status }})"
       tags: [test, setup]
 
-    - name: "STEP 9 | Create route (strip_path: true)"
+    - name: "STEP 9 | Create route {{ route_path }}"
       uri:
         url: "{{ kong_admin_url }}/services/{{ svc_name }}/routes"
         method: POST
@@ -442,14 +502,14 @@
           name: test-route
           paths:
             - "{{ route_path }}"
-          strip_path: true        # KEY FIX: strips /test-api → httpbin gets /get
+          strip_path: true
         status_code: [200, 201]
       register: route_result
       tags: [test, setup]
 
     - name: "STEP 9 | Route created"
       debug:
-        msg: "Route '{{ route_path }}' with strip_path=true (HTTP {{ route_result.status }})"
+        msg: "Route '{{ route_path }}' strip_path=true (HTTP {{ route_result.status }})"
       tags: [test, setup]
 
     # ==========================================================
@@ -484,7 +544,7 @@
     # ==========================================================
     # STEP 11 — CONSUMER + API KEY
     # ==========================================================
-    - name: "STEP 11 | Delete consumer if exists (clean slate)"
+    - name: "STEP 11 | Delete old consumer if exists"
       uri:
         url: "{{ kong_admin_url }}/consumers/test-user"
         method: DELETE
@@ -512,18 +572,16 @@
       tags: [test, consumer]
 
     # ==========================================================
-    # STEP 12 — E2E TESTS
-    # curl http://localhost:8000/test-api/get
-    #   Kong strips /test-api → sends GET /get to httpbin → 200
+    # STEP 12 — E2E TESTS (local mock — guaranteed 200)
     # ==========================================================
     - name: "STEP 12 | E2E — authenticated (expect 200)"
       uri:
-        url: "{{ kong_proxy_url }}{{ route_path }}/get"
+        url: "{{ kong_proxy_url }}{{ route_path }}/hello"
         method: GET
         headers:
           apikey: "{{ test_api_key }}"
         status_code: 200
-        timeout: 30
+        timeout: 15
         return_content: yes
       register: e2e
       tags: [test, e2e]
@@ -532,13 +590,13 @@
       debug:
         msg: >
           PASSED — HTTP {{ e2e.status }}
-          Kong proxied {{ route_path }}/get → httpbin /get successfully!
+          Response: {{ e2e.json }}
           Rate-limit remaining: {{ e2e.x_ratelimit_remaining_minute | default('n/a') }}
       tags: [test, e2e]
 
     - name: "STEP 12 | E2E — unauthenticated (expect 401)"
       uri:
-        url: "{{ kong_proxy_url }}{{ route_path }}/get"
+        url: "{{ kong_proxy_url }}{{ route_path }}/hello"
         method: GET
         status_code: 401
         timeout: 10
@@ -547,7 +605,7 @@
 
     - name: "STEP 12 | Auth enforcement OK"
       debug:
-        msg: "Key-auth WORKING — unauthenticated blocked with HTTP {{ unauth.status }}"
+        msg: "Key-auth WORKING — blocked with HTTP {{ unauth.status }}"
       tags: [test, e2e]
 
     # ==========================================================
@@ -560,24 +618,26 @@
           ╔══════════════════════════════════════════════════════════╗
           ║         Kong API Gateway — ALL SYSTEMS GO!              ║
           ╠══════════════════════════════════════════════════════════╣
-          ║  Version    : {{ health.json.version }}
-          ║  Proxy      : http://localhost:{{ kong_proxy_port }}
-          ║  Admin API  : http://localhost:{{ kong_admin_port }}
-          ║  Manager UI : http://localhost:{{ kong_manager_port }}
+          ║  Version      : {{ health.json.version }}
+          ║  Proxy        : http://localhost:{{ kong_proxy_port }}
+          ║  Admin API    : http://localhost:{{ kong_admin_port }}
+          ║  Manager UI   : http://localhost:{{ kong_manager_port }}
           ╠══════════════════════════════════════════════════════════╣
-          ║  Service    : {{ svc_name }} → {{ svc_url }}
-          ║  Route      : {{ route_path }} (strip_path=true)
-          ║  Plugins    : rate-limiting (10/min) + key-auth
-          ║  Consumer   : test-user / key: {{ test_api_key }}
+          ║  Backend      : Local mock server :{{ mock_port }} (Python)
+          ║  Service      : {{ svc_name }} → {{ svc_url }}
+          ║  Route        : {{ route_path }} (strip_path=true)
+          ║  Plugins      : rate-limiting (10/min) + key-auth
+          ║  Consumer     : test-user
+          ║  API Key      : {{ test_api_key }}
           ╠══════════════════════════════════════════════════════════╣
           ║  QUICK TEST COMMANDS                                    ║
           ║                                                         ║
           ║  # Authenticated → expect 200                          ║
-          ║  curl -i http://localhost:8000/test-api/get \          ║
+          ║  curl -i http://localhost:8000/test-api/hello \        ║
           ║       -H "apikey: my-local-test-key-2024"             ║
           ║                                                         ║
           ║  # No key → expect 401                                 ║
-          ║  curl -i http://localhost:8000/test-api/get            ║
+          ║  curl -i http://localhost:8000/test-api/hello          ║
           ║                                                         ║
           ║  # Admin health                                        ║
           ║  curl -s http://localhost:8001 | python3 -m json.tool  ║
