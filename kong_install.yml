@@ -19,9 +19,9 @@
     kong_admin_url: "http://127.0.0.1:8001"
     kong_proxy_url: "http://127.0.0.1:8000"
 
-    mock_port: 9090
+    mock_port: 19090
     svc_name: local-mock-service
-    svc_url: "http://127.0.0.1:9090"
+    svc_url: "http://127.0.0.1:19090"
     route_path: /test-api
     test_api_key: "my-local-test-key-2024"
 
@@ -30,18 +30,6 @@
       assert:
         that: ansible_distribution == "Ubuntu"
         fail_msg: "This playbook requires Ubuntu"
-
-    - name: Stop apt background jobs and clear locks
-      shell: |
-        killall apt apt-get unattended-upgrades dpkg 2>/dev/null || true
-        systemctl stop unattended-upgrades 2>/dev/null || true
-        rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
-        rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock
-        dpkg --configure -a || true
-      args:
-        executable: /bin/bash
-      changed_when: false
-      failed_when: false
 
     - name: Update apt cache
       apt:
@@ -128,11 +116,10 @@
         content: |
           #!/usr/bin/env python3
           from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-          import json
-          import datetime
+          import json, datetime
 
           class Handler(BaseHTTPRequestHandler):
-              def _reply(self):
+              def reply(self):
                   body = json.dumps({
                       "status": "ok",
                       "path": self.path,
@@ -147,10 +134,10 @@
                   self.wfile.write(body)
 
               def do_GET(self):
-                  self._reply()
+                  self.reply()
 
               def do_POST(self):
-                  self._reply()
+                  self.reply()
 
               def log_message(self, format, *args):
                   return
@@ -175,13 +162,21 @@
         delay: 1
         timeout: 20
 
-    - name: Verify mock backend
+    - name: Verify mock backend root
       uri:
         url: "http://127.0.0.1:{{ mock_port }}/"
         method: GET
         status_code: 200
         return_content: yes
-      register: mock_check
+      register: mock_root
+
+    - name: Verify mock backend exact forwarded path
+      uri:
+        url: "http://127.0.0.1:{{ mock_port }}{{ route_path }}/hello"
+        method: GET
+        status_code: 200
+        return_content: yes
+      register: mock_exact
 
     - name: Copy default kong.conf if missing
       copy:
@@ -215,7 +210,6 @@
 
     - name: Check Kong config
       command: "{{ kong_bin.stdout }} check {{ kong_conf }}"
-      register: kong_check
       changed_when: false
 
     - name: Bootstrap Kong DB
@@ -299,7 +293,6 @@
           name: "{{ svc_name }}"
           url: "{{ svc_url }}"
         status_code: [200, 201]
-      register: svc_result
 
     - name: Create route
       uri:
@@ -312,7 +305,6 @@
             - "{{ route_path }}"
           strip_path: false
         status_code: [200, 201]
-      register: route_result
 
     - name: Add rate limiting plugin
       uri:
@@ -362,6 +354,18 @@
           key: "{{ test_api_key }}"
         status_code: [200, 201]
 
+    - name: Pause briefly for route propagation
+      pause:
+        seconds: 3
+
+    - name: Verify route through Kong without auth should be 401
+      uri:
+        url: "{{ kong_proxy_url }}{{ route_path }}/hello"
+        method: GET
+        status_code: 401
+        timeout: 15
+      register: noauth_probe
+
     - name: Authenticated E2E request
       uri:
         url: "{{ kong_proxy_url }}{{ route_path }}/hello"
@@ -373,23 +377,14 @@
         return_content: yes
       register: e2e
 
-    - name: Unauthenticated E2E request
-      uri:
-        url: "{{ kong_proxy_url }}{{ route_path }}/hello"
-        method: GET
-        status_code: 401
-        timeout: 10
-      register: unauth
-
     - name: Final summary
       debug:
         msg:
           - "Kong version: {{ kong_ver.stdout }}"
           - "Admin API: {{ kong_admin_url }}"
           - "Proxy: {{ kong_proxy_url }}"
-          - "Mock backend: http://127.0.0.1:{{ mock_port }}/"
-          - "Mock verify: HTTP {{ mock_check.status }}"
-          - "Route: {{ route_path }}"
-          - "Authenticated request: HTTP {{ e2e.status }}"
-          - "Unauthenticated request: HTTP {{ unauth.status }}"
+          - "Mock root: HTTP {{ mock_root.status }}"
+          - "Mock exact path: HTTP {{ mock_exact.status }}"
+          - "No-auth through Kong: HTTP {{ noauth_probe.status }}"
+          - "Authenticated through Kong: HTTP {{ e2e.status }}"
           - "API key: {{ test_api_key }}"
