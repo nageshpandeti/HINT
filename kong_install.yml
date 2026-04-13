@@ -2,20 +2,12 @@
 # ============================================================
 # Kong API Gateway — Complete Single-File Ansible Playbook
 # Ubuntu 22.04 (Jammy)
-# Fixes applied:
-#   1. Removes broken RabbitMQ/third-party PPAs before apt update
-#   2. Fixed Jinja2 last() filter (was passing wrong args)
-#   3. All apt via shell to bypass Ansible apt module lock issues
+# Fix applied:
+#   become_user: postgres fails with chmod/tmp permission error
+#   → replaced with direct shell psql commands (no become_user)
 # ============================================================
 #
-# STEP 0 — Run in terminal BEFORE playbook:
-#
-#   sudo rm -f /etc/apt/sources.list.d/rabbitmq*.list*
-#   sudo rm -f /etc/apt/sources.list.d/ppa*.list*
-#   sudo apt-get update
-#
-# STEP 1 — Run the playbook:
-#
+# Run the playbook:
 #   ansible-playbook Kong_install.yml -v
 #
 # ============================================================
@@ -62,7 +54,6 @@
         msg: "Ubuntu {{ ansible_distribution_version }} ({{ ansible_distribution_release }}) | RAM {{ ansible_memtotal_mb }}MB"
       tags: always
 
-    # ── Kill background apt/dpkg ───────────────────────────────
     - name: "PRE | Kill background apt processes"
       shell: |
         killall apt apt-get unattended-upgrades dpkg 2>/dev/null || true
@@ -71,7 +62,6 @@
       changed_when: false
       tags: always
 
-    # ── Remove ALL lock files ──────────────────────────────────
     - name: "PRE | Remove apt/dpkg lock files"
       shell: |
         rm -f /var/lib/dpkg/lock
@@ -82,39 +72,27 @@
       changed_when: false
       tags: always
 
-    # ── Repair dpkg ────────────────────────────────────────────
     - name: "PRE | Repair dpkg state"
       shell: dpkg --configure -a 2>&1 || true
       changed_when: false
       tags: always
 
-    # ── FIX: Remove broken third-party PPAs (RabbitMQ etc.) ───
-    # This is the root cause of your apt update failure
-    - name: "PRE | Remove broken third-party apt sources"
+    - name: "PRE | Remove broken RabbitMQ/third-party PPAs"
       shell: |
-        echo "=== Removing broken PPAs ==="
-        # Remove RabbitMQ PPA (ppa1.rabbitmq.com was failing)
         rm -f /etc/apt/sources.list.d/rabbitmq*.list
         rm -f /etc/apt/sources.list.d/rabbitmq*.sources
         rm -f /etc/apt/sources.list.d/rabbitmq*.list.bak
-
-        # Remove any other failing non-Ubuntu PPAs
         for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
           [ -f "$f" ] || continue
-          # keep Ubuntu/Canonical sources and already-created Kong sources
           fname=$(basename "$f")
-          if [[ "$fname" == *"rabbitmq"* ]] || \
-             [[ "$fname" == *"ppa1"* ]] || \
-             [[ "$fname" == *"ppa2"* ]]; then
-            echo "Removing broken source: $f"
+          if [[ "$fname" == *"rabbitmq"* ]] || [[ "$fname" == *"ppa1"* ]] || [[ "$fname" == *"ppa2"* ]]; then
+            echo "Removing: $f"
             rm -f "$f"
           fi
         done
-        echo "=== Done removing broken PPAs ==="
       changed_when: false
       tags: always
 
-    # ── apt update via shell ───────────────────────────────────
     - name: "PRE | Run apt-get update"
       shell: |
         export DEBIAN_FRONTEND=noninteractive
@@ -124,14 +102,12 @@
       failed_when: false
       tags: always
 
-    # FIX: Use [-5:] slice syntax — NOT last() with args
-    - name: "PRE | apt update output (last 5 lines)"
+    - name: "PRE | apt update result"
       debug:
         msg: "{{ apt_update_out.stdout_lines[-5:] }}"
       tags: always
 
-    # ── Network check ─────────────────────────────────────────
-    - name: "PRE | Check internet connectivity"
+    - name: "PRE | Check internet"
       shell: curl -sI https://archive.ubuntu.com --max-time 8 | head -1
       register: net_check
       changed_when: false
@@ -148,10 +124,7 @@
 
     - name: "PRE | Fail if no internet"
       fail:
-        msg: |
-          No internet access from the VM.
-          In VirtualBox: Settings -> Network -> Adapter 1 -> Attached to: NAT
-          Then restart VM and re-run.
+        msg: "No internet. VirtualBox: Settings -> Network -> Adapter 1 -> Attached to: NAT"
       when: net_check.rc != 0
       tags: always
 
@@ -177,7 +150,7 @@
       tags: [prereqs]
 
     # ==========================================================
-    # STEP 2 — POSTGRESQL
+    # STEP 2 — POSTGRESQL (all via shell su -c — no become_user)
     # ==========================================================
     - name: "STEP 2 | Install PostgreSQL"
       shell: |
@@ -202,32 +175,53 @@
         timeout: 30
       tags: [postgres]
 
-    - name: "STEP 2 | Create Kong DB user"
-      become_user: postgres
-      community.postgresql.postgresql_user:
-        name: "{{ pg_user }}"
-        password: "{{ pg_password }}"
-        role_attr_flags: CREATEDB,LOGIN
-        state: present
+    # FIX: Use shell + su -c instead of become_user: postgres
+    # This avoids the chmod tmp file permission error entirely
+    - name: "STEP 2 | Create Kong DB user (via psql shell)"
+      shell: |
+        su -c "psql -tc \"SELECT 1 FROM pg_user WHERE usename='{{ pg_user }}'\"" postgres \
+          | grep -q 1 && echo "user exists" || \
+        su -c "psql -c \"CREATE USER {{ pg_user }} WITH PASSWORD '{{ pg_password }}' CREATEDB LOGIN;\"" postgres
+      register: pg_user_result
+      changed_when: "'user exists' not in pg_user_result.stdout"
       tags: [postgres]
 
-    - name: "STEP 2 | Create Kong database"
-      become_user: postgres
-      community.postgresql.postgresql_db:
-        name: "{{ pg_db }}"
-        owner: "{{ pg_user }}"
-        encoding: UTF8
-        state: present
+    - name: "STEP 2 | User result"
+      debug:
+        msg: "{{ 'User already exists' if 'user exists' in pg_user_result.stdout else 'User created: ' ~ pg_user }}"
       tags: [postgres]
 
-    - name: "STEP 2 | Grant all privileges"
-      become_user: postgres
-      community.postgresql.postgresql_privs:
-        db: "{{ pg_db }}"
-        role: "{{ pg_user }}"
-        type: database
-        privs: ALL
-        state: present
+    - name: "STEP 2 | Create Kong database (via psql shell)"
+      shell: |
+        su -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='{{ pg_db }}'\"" postgres \
+          | grep -q 1 && echo "db exists" || \
+        su -c "psql -c \"CREATE DATABASE {{ pg_db }} OWNER {{ pg_user }} ENCODING 'UTF8';\"" postgres
+      register: pg_db_result
+      changed_when: "'db exists' not in pg_db_result.stdout"
+      tags: [postgres]
+
+    - name: "STEP 2 | Database result"
+      debug:
+        msg: "{{ 'Database already exists' if 'db exists' in pg_db_result.stdout else 'Database created: ' ~ pg_db }}"
+      tags: [postgres]
+
+    - name: "STEP 2 | Grant all privileges (via psql shell)"
+      shell: |
+        su -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE {{ pg_db }} TO {{ pg_user }};\"" postgres
+      changed_when: true
+      tags: [postgres]
+
+    - name: "STEP 2 | Verify DB connection as kong user"
+      shell: |
+        PGPASSWORD="{{ pg_password }}" psql -h 127.0.0.1 -U {{ pg_user }} -d {{ pg_db }} -c "\conninfo" 2>&1
+      register: db_verify
+      changed_when: false
+      failed_when: db_verify.rc != 0
+      tags: [postgres]
+
+    - name: "STEP 2 | DB connection verified"
+      debug:
+        msg: "{{ db_verify.stdout }}"
       tags: [postgres]
 
     # ==========================================================
@@ -304,6 +298,17 @@
           proxy_listen = 0.0.0.0:{{ kong_proxy_port }}
           admin_listen = 0.0.0.0:{{ kong_admin_port }}
           admin_gui_listen = 0.0.0.0:{{ kong_manager_port }}
+      tags: [configure]
+
+    - name: "STEP 4 | Show injected config"
+      shell: grep -A 15 "ANSIBLE MANAGED BLOCK" {{ kong_conf }} | head -20
+      register: conf_show
+      changed_when: false
+      tags: [configure]
+
+    - name: "STEP 4 | Config preview"
+      debug:
+        msg: "{{ conf_show.stdout_lines }}"
       tags: [configure]
 
     # ==========================================================
@@ -409,7 +414,7 @@
 
     - name: "STEP 8 | Service result"
       debug:
-        msg: "'{{ svc_name }}' (HTTP {{ svc_result.status }})"
+        msg: "'{{ svc_name }}' → {{ svc_url }} (HTTP {{ svc_result.status }})"
       tags: [test, setup]
 
     # ==========================================================
