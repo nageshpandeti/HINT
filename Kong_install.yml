@@ -1,66 +1,90 @@
 ---
-# =============================================================================
-# Ansible Playbook: Install & Test Kong API Gateway on Ubuntu
-# =============================================================================
-# Usage:
-#   ansible-playbook -i inventory.ini install_kong.yml
-#   ansible-playbook -i inventory.ini install_kong.yml --tags install
-#   ansible-playbook -i inventory.ini install_kong.yml --tags test
-# =============================================================================
+# ============================================================
+# Kong API Gateway — Complete Single-File Ansible Playbook
+# ============================================================
+#
+# ⚠️  FIX from previous error:
+#      OLD broken file had:  hosts: kong_servers  ← caused "no hosts matched"
+#      THIS file uses:       hosts: localhost      ← runs on THIS machine
+#                            connection: local     ← no SSH, no inventory needed
+#
+# STEP 0 — Prepare Ansible (run once):
+#
+#   sudo apt update && sudo apt install -y ansible python3-psycopg2
+#   ansible-galaxy collection install community.postgresql
+#
+# STEP 1 — Run the full playbook:
+#
+#   ansible-playbook RUN_THIS_kong.yml -v
+#
+# STEP 2 — Run specific steps only:
+#
+#   ansible-playbook RUN_THIS_kong.yml --tags prereqs
+#   ansible-playbook RUN_THIS_kong.yml --tags postgres
+#   ansible-playbook RUN_THIS_kong.yml --tags kong_install
+#   ansible-playbook RUN_THIS_kong.yml --tags configure
+#   ansible-playbook RUN_THIS_kong.yml --tags start
+#   ansible-playbook RUN_THIS_kong.yml --tags test
+#   ansible-playbook RUN_THIS_kong.yml --tags e2e
+#   ansible-playbook RUN_THIS_kong.yml --tags summary
+# ============================================================
 
-- name: Install and Test Kong API Gateway
-  hosts: kong_servers
-  become: true
+- name: Kong API Gateway — Install and Test
+  hosts: localhost        # runs on THIS machine, no inventory file needed
+  connection: local       # no SSH required
+  become: true            # uses sudo
+  gather_facts: true
+
+  # ----------------------------------------------------------
+  # ALL CONFIG — change values here if needed
+  # ----------------------------------------------------------
   vars:
-    kong_admin_url: "http://localhost:8001"
-    kong_proxy_url: "http://localhost:8000"
+    pg_user:           kong
+    pg_password:       "KongSecret@2024"
+    pg_db:             kong
+    pg_host:           "127.0.0.1"
+    pg_port:           5432
+    kong_conf:         /etc/kong/kong.conf
+    kong_proxy_port:   8000
+    kong_admin_port:   8001
     kong_manager_port: 8002
-    kong_test_service_name: "httpbin-service"
-    kong_test_route_path: "/test-api"
-    kong_test_backend_url: "https://httpbin.org"
-    postgres_user: kong
-    postgres_password: "KongPass@2024"
-    postgres_db: kong
+    kong_admin_url:    "http://localhost:8001"
+    kong_proxy_url:    "http://localhost:8000"
+    kong_gpg_url:      "https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key"
+    kong_repo_url:     "https://packages.konghq.com/public/gateway-39/config.deb.txt"
+    kong_keyring:      "/usr/share/keyrings/kong-gateway-39-archive-keyring.gpg"
+    kong_sources:      "/etc/apt/sources.list.d/kong-gateway-39.list"
+    svc_name:          httpbin-service
+    svc_url:           "https://httpbin.org"
+    route_path:        /test-api
+    test_api_key:      "my-local-test-key-2024"
 
-  # ---------------------------------------------------------------------------
-  # PRE-TASKS: System checks
-  # ---------------------------------------------------------------------------
+  # ----------------------------------------------------------
   pre_tasks:
-    - name: Check Ubuntu version
-      command: lsb_release -sc
-      register: ubuntu_codename
-      changed_when: false
+    - name: Assert Ubuntu
+      assert:
+        that: ansible_distribution == "Ubuntu"
+        fail_msg: "Requires Ubuntu. Found: {{ ansible_distribution }}"
+      tags: always
 
-    - name: Show Ubuntu codename
+    - name: System info
       debug:
-        msg: "Detected Ubuntu codename: {{ ubuntu_codename.stdout }}"
+        msg: "Ubuntu {{ ansible_distribution_version }} ({{ ansible_distribution_release }}) | RAM {{ ansible_memtotal_mb }}MB"
+      tags: always
 
-    - name: Check available memory
-      command: free -m
-      register: memory_info
-      changed_when: false
-
-    - name: Fail if less than 1GB RAM available
-      fail:
-        msg: "Insufficient memory. Kong requires at least 1GB RAM."
-      when: ansible_memtotal_mb < 1024
-
-  # ---------------------------------------------------------------------------
-  # TASKS
-  # ---------------------------------------------------------------------------
+  # ----------------------------------------------------------
   tasks:
 
-    # -------------------------------------------------------------------------
-    # BLOCK 1: System prerequisites
-    # -------------------------------------------------------------------------
-    - name: Update apt cache and upgrade packages
+    # ==========================================================
+    # STEP 1 — PREREQUISITES
+    # ==========================================================
+    - name: "STEP 1 | apt update"
       apt:
         update_cache: yes
-        upgrade: dist
         cache_valid_time: 3600
-      tags: [install, prereqs]
+      tags: [prereqs]
 
-    - name: Install required system packages
+    - name: "STEP 1 | Install system dependencies"
       apt:
         name:
           - curl
@@ -68,150 +92,164 @@
           - apt-transport-https
           - ca-certificates
           - lsb-release
-          - python3-psycopg2   # needed for Ansible PostgreSQL modules
+          - python3-psycopg2
         state: present
-      tags: [install, prereqs]
+      tags: [prereqs]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 2: PostgreSQL setup
-    # -------------------------------------------------------------------------
-    - name: Install PostgreSQL
+    # ==========================================================
+    # STEP 2 — POSTGRESQL
+    # ==========================================================
+    - name: "STEP 2 | Install PostgreSQL"
       apt:
         name:
           - postgresql
           - postgresql-contrib
         state: present
-      tags: [install, postgres]
+      tags: [postgres]
 
-    - name: Ensure PostgreSQL service is started and enabled
+    - name: "STEP 2 | Start and enable PostgreSQL"
       service:
         name: postgresql
         state: started
         enabled: yes
-      tags: [install, postgres]
+      tags: [postgres]
 
-    - name: Create Kong PostgreSQL user
+    - name: "STEP 2 | Create Kong DB user"
       become_user: postgres
       community.postgresql.postgresql_user:
-        name: "{{ postgres_user }}"
-        password: "{{ postgres_password }}"
+        name: "{{ pg_user }}"
+        password: "{{ pg_password }}"
         role_attr_flags: CREATEDB,LOGIN
         state: present
-      tags: [install, postgres]
+      tags: [postgres]
 
-    - name: Create Kong database
+    - name: "STEP 2 | Create Kong database"
       become_user: postgres
       community.postgresql.postgresql_db:
-        name: "{{ postgres_db }}"
-        owner: "{{ postgres_user }}"
+        name: "{{ pg_db }}"
+        owner: "{{ pg_user }}"
+        encoding: UTF8
         state: present
-      tags: [install, postgres]
+      tags: [postgres]
 
-    - name: Grant all privileges on Kong database to Kong user
+    - name: "STEP 2 | Grant all privileges"
       become_user: postgres
       community.postgresql.postgresql_privs:
-        db: "{{ postgres_db }}"
-        role: "{{ postgres_user }}"
+        db: "{{ pg_db }}"
+        role: "{{ pg_user }}"
         type: database
         privs: ALL
         state: present
-      tags: [install, postgres]
+      tags: [postgres]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 3: Install Kong
-    # -------------------------------------------------------------------------
-    - name: Add Kong GPG key
-      shell: |
-        curl -1sLf "https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key" \
-        | gpg --dearmor \
-        | tee /usr/share/keyrings/kong-gateway-39-archive-keyring.gpg > /dev/null
+    # ==========================================================
+    # STEP 3 — INSTALL KONG
+    # ==========================================================
+    - name: "STEP 3 | Add Kong GPG key"
+      shell: >
+        curl -1sLf "{{ kong_gpg_url }}"
+        | gpg --dearmor
+        | tee {{ kong_keyring }} > /dev/null
       args:
-        creates: /usr/share/keyrings/kong-gateway-39-archive-keyring.gpg
-      tags: [install, kong]
+        creates: "{{ kong_keyring }}"
+      tags: [kong_install]
 
-    - name: Add Kong APT repository
-      shell: |
-        curl -1sLf \
-        "https://packages.konghq.com/public/gateway-39/config.deb.txt?distro=ubuntu&codename={{ ubuntu_codename.stdout }}" \
-        | tee /etc/apt/sources.list.d/kong-gateway-39.list > /dev/null
+    - name: "STEP 3 | Add Kong APT repo"
+      shell: >
+        curl -1sLf
+        "{{ kong_repo_url }}?distro=ubuntu&codename={{ ansible_distribution_release }}"
+        | tee {{ kong_sources }} > /dev/null
       args:
-        creates: /etc/apt/sources.list.d/kong-gateway-39.list
-      tags: [install, kong]
+        creates: "{{ kong_sources }}"
+      tags: [kong_install]
 
-    - name: Update apt cache after adding Kong repo
+    - name: "STEP 3 | apt update after new repo"
       apt:
         update_cache: yes
-      tags: [install, kong]
+      tags: [kong_install]
 
-    - name: Install Kong Gateway OSS
+    - name: "STEP 3 | Install Kong Gateway OSS"
       apt:
         name: kong
         state: present
-      tags: [install, kong]
+      tags: [kong_install]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 4: Configure Kong
-    # -------------------------------------------------------------------------
-    - name: Copy default Kong config as active config
+    - name: "STEP 3 | Verify kong binary"
+      command: kong version
+      register: kong_ver
+      changed_when: false
+      tags: [kong_install]
+
+    - name: "STEP 3 | Show Kong version"
+      debug:
+        msg: "Installed: {{ kong_ver.stdout }}"
+      tags: [kong_install]
+
+    # ==========================================================
+    # STEP 4 — CONFIGURE kong.conf
+    # ==========================================================
+    - name: "STEP 4 | Copy default to active kong.conf"
       copy:
         src: /etc/kong/kong.conf.default
-        dest: /etc/kong/kong.conf
+        dest: "{{ kong_conf }}"
         remote_src: yes
         force: no
         owner: root
-        group: root
-        mode: '0644'
-      tags: [install, configure]
+        mode: "0644"
+      tags: [configure]
 
-    - name: Configure Kong database settings
+    - name: "STEP 4 | Inject DB + listener settings"
       blockinfile:
-        path: /etc/kong/kong.conf
-        marker: "# {mark} ANSIBLE MANAGED BLOCK - Database"
+        path: "{{ kong_conf }}"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
         block: |
           database = postgres
-          pg_host = 127.0.0.1
-          pg_port = 5432
-          pg_user = {{ postgres_user }}
-          pg_password = {{ postgres_password }}
-          pg_database = {{ postgres_db }}
-      tags: [install, configure]
-
-    - name: Configure Kong proxy and admin listen addresses
-      blockinfile:
-        path: /etc/kong/kong.conf
-        marker: "# {mark} ANSIBLE MANAGED BLOCK - Listeners"
-        block: |
-          proxy_listen = 0.0.0.0:8000
-          admin_listen = 0.0.0.0:8001
+          pg_host = {{ pg_host }}
+          pg_port = {{ pg_port }}
+          pg_user = {{ pg_user }}
+          pg_password = {{ pg_password }}
+          pg_database = {{ pg_db }}
+          proxy_listen = 0.0.0.0:{{ kong_proxy_port }}
+          admin_listen = 0.0.0.0:{{ kong_admin_port }}
           admin_gui_listen = 0.0.0.0:{{ kong_manager_port }}
-      tags: [install, configure]
+      tags: [configure]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 5: Run DB migrations and start Kong
-    # -------------------------------------------------------------------------
-    - name: Run Kong database migrations
-      command: kong migrations bootstrap -c /etc/kong/kong.conf
-      register: migration_result
+    # ==========================================================
+    # STEP 5 — DB MIGRATIONS
+    # ==========================================================
+    - name: "STEP 5 | Bootstrap Kong database"
+      command: kong migrations bootstrap -c {{ kong_conf }}
+      register: mig
       failed_when:
-        - migration_result.rc != 0
-        - "'already bootstrapped' not in migration_result.stderr"
-      changed_when: "'already bootstrapped' not in migration_result.stderr"
-      tags: [install, migrate]
+        - mig.rc != 0
+        - "'already bootstrapped' not in (mig.stderr | default(''))"
+      changed_when: "'already bootstrapped' not in (mig.stderr | default(''))"
+      tags: [migrate, start]
 
-    - name: Create Kong systemd service file
+    - name: "STEP 5 | Migration result"
+      debug:
+        msg: "{{ 'Already bootstrapped — skipped' if 'already bootstrapped' in (mig.stderr | default('')) else 'Migrations completed successfully' }}"
+      tags: [migrate, start]
+
+    # ==========================================================
+    # STEP 6 — SYSTEMD SERVICE
+    # ==========================================================
+    - name: "STEP 6 | Create Kong systemd unit file"
       copy:
         dest: /lib/systemd/system/kong.service
+        owner: root
+        mode: "0644"
         content: |
           [Unit]
           Description=Kong API Gateway
-          After=syslog.target network.target postgresql.service
+          After=network.target postgresql.service
 
           [Service]
           User=root
           Group=root
           Type=forking
           ExecStartPre=/usr/local/bin/kong prepare -p /usr/local/kong -c /etc/kong/kong.conf
-          ExecStart=/usr/local/bin/kong start -c /etc/kong/kong.conf
+          ExecStart=/usr/local/bin/kong start   -c /etc/kong/kong.conf
           ExecReload=/usr/local/bin/kong reload -c /etc/kong/kong.conf
           ExecStop=/usr/local/bin/kong stop
           Restart=on-failure
@@ -219,105 +257,102 @@
 
           [Install]
           WantedBy=multi-user.target
-        owner: root
-        group: root
-        mode: '0644'
-      notify: Reload systemd
-      tags: [install, service]
+      tags: [start]
 
-    - name: Reload systemd daemon
+    - name: "STEP 6 | Reload systemd daemon"
       systemd:
         daemon_reload: yes
-      tags: [install, service]
+      tags: [start]
 
-    - name: Start and enable Kong service
+    - name: "STEP 6 | Start and enable Kong"
       service:
         name: kong
         state: started
         enabled: yes
-      tags: [install, service]
+      tags: [start]
 
-    - name: Wait for Kong Admin API to be ready (port 8001)
+    - name: "STEP 6 | Wait for Admin API port 8001"
       wait_for:
         host: localhost
-        port: 8001
+        port: "{{ kong_admin_port }}"
         delay: 5
         timeout: 60
-        msg: "Kong Admin API did not come up on port 8001 within 60 seconds"
-      tags: [install, service]
+      tags: [start]
 
-    - name: Wait for Kong Proxy to be ready (port 8000)
+    - name: "STEP 6 | Wait for Proxy port 8000"
       wait_for:
         host: localhost
-        port: 8000
-        delay: 3
+        port: "{{ kong_proxy_port }}"
+        delay: 2
         timeout: 30
-      tags: [install, service]
+      tags: [start]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 6: Verify Kong is running
-    # -------------------------------------------------------------------------
-    - name: Check Kong Admin API health
+    # ==========================================================
+    # STEP 7 — HEALTH CHECK
+    # ==========================================================
+    - name: "STEP 7 | Admin API health check"
       uri:
         url: "{{ kong_admin_url }}"
         method: GET
         status_code: 200
         return_content: yes
-      register: kong_health
-      tags: [install, verify]
+        timeout: 10
+      register: health
+      tags: [start, test, summary]
 
-    - name: Show Kong version
+    - name: "STEP 7 | Kong healthy"
       debug:
-        msg: "Kong is running! Version: {{ (kong_health.json.version | default('unknown')) }}"
-      tags: [install, verify]
+        msg: "Kong v{{ health.json.version }} is UP — proxy :{{ kong_proxy_port }} | admin :{{ kong_admin_port }}"
+      tags: [start, test, summary]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 7: Create test Service and Route
-    # -------------------------------------------------------------------------
-    - name: Create test Service (httpbin backend)
+    # ==========================================================
+    # STEP 8 — CREATE SERVICE
+    # ==========================================================
+    - name: "STEP 8 | Create service pointing to httpbin"
       uri:
         url: "{{ kong_admin_url }}/services"
         method: POST
         body_format: json
         body:
-          name: "{{ kong_test_service_name }}"
-          url: "{{ kong_test_backend_url }}"
-        status_code: [200, 201, 409]  # 409 = already exists
-        return_content: yes
-      register: create_service
+          name: "{{ svc_name }}"
+          url: "{{ svc_url }}"
+        status_code: [200, 201, 409]
+      register: svc_result
       tags: [test, setup]
 
-    - name: Show service creation result
+    - name: "STEP 8 | Service result"
       debug:
-        msg: "Service '{{ kong_test_service_name }}' status: {{ create_service.status }}"
+        msg: "'{{ svc_name }}' created (HTTP {{ svc_result.status }})"
       tags: [test, setup]
 
-    - name: Create test Route for the service
+    # ==========================================================
+    # STEP 9 — CREATE ROUTE
+    # ==========================================================
+    - name: "STEP 9 | Create route {{ route_path }}"
       uri:
-        url: "{{ kong_admin_url }}/services/{{ kong_test_service_name }}/routes"
+        url: "{{ kong_admin_url }}/services/{{ svc_name }}/routes"
         method: POST
         body_format: json
         body:
-          name: "test-route"
+          name: test-route
           paths:
-            - "{{ kong_test_route_path }}"
+            - "{{ route_path }}"
           strip_path: false
         status_code: [200, 201, 409]
-        return_content: yes
-      register: create_route
+      register: route_result
       tags: [test, setup]
 
-    - name: Show route creation result
+    - name: "STEP 9 | Route result"
       debug:
-        msg: "Route for path '{{ kong_test_route_path }}' status: {{ create_route.status }}"
+        msg: "Route '{{ route_path }}' created (HTTP {{ route_result.status }})"
       tags: [test, setup]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 8: Add Rate Limiting Plugin
-    # -------------------------------------------------------------------------
-    - name: Add Rate Limiting plugin to test service
+    # ==========================================================
+    # STEP 10 — PLUGINS
+    # ==========================================================
+    - name: "STEP 10 | Add Rate-Limiting plugin (10 req/min)"
       uri:
-        url: "{{ kong_admin_url }}/services/{{ kong_test_service_name }}/plugins"
+        url: "{{ kong_admin_url }}/services/{{ svc_name }}/plugins"
         method: POST
         body_format: json
         body:
@@ -326,89 +361,136 @@
             minute: 10
             policy: local
         status_code: [200, 201, 409]
-      register: rate_limit_plugin
       tags: [test, plugins]
 
-    - name: Show rate limiting plugin result
-      debug:
-        msg: "Rate limiting plugin status: {{ rate_limit_plugin.status }}"
-      tags: [test, plugins]
-
-    # -------------------------------------------------------------------------
-    # BLOCK 9: End-to-end proxy test
-    # -------------------------------------------------------------------------
-    - name: Test proxy via Kong (GET request through Kong)
+    - name: "STEP 10 | Add Key-Auth plugin"
       uri:
-        url: "{{ kong_proxy_url }}{{ kong_test_route_path }}/get"
+        url: "{{ kong_admin_url }}/services/{{ svc_name }}/plugins"
+        method: POST
+        body_format: json
+        body:
+          name: key-auth
+          config:
+            key_names:
+              - apikey
+        status_code: [200, 201, 409]
+      tags: [test, plugins]
+
+    # ==========================================================
+    # STEP 11 — CONSUMER + API KEY
+    # ==========================================================
+    - name: "STEP 11 | Create test consumer"
+      uri:
+        url: "{{ kong_admin_url }}/consumers"
+        method: POST
+        body_format: json
+        body:
+          username: test-user
+        status_code: [200, 201, 409]
+      tags: [test, consumer]
+
+    - name: "STEP 11 | Assign API key to test-user"
+      uri:
+        url: "{{ kong_admin_url }}/consumers/test-user/key-auth"
+        method: POST
+        body_format: json
+        body:
+          key: "{{ test_api_key }}"
+        status_code: [200, 201, 409]
+      tags: [test, consumer]
+
+    # ==========================================================
+    # STEP 12 — END-TO-END PROXY TESTS
+    # ==========================================================
+    - name: "STEP 12 | E2E test — authenticated request (expect 200)"
+      uri:
+        url: "{{ kong_proxy_url }}{{ route_path }}/get"
         method: GET
+        headers:
+          apikey: "{{ test_api_key }}"
         status_code: 200
-        return_content: yes
         timeout: 30
-      register: proxy_test
+      register: e2e
       tags: [test, e2e]
 
-    - name: Show proxy test result
+    - name: "STEP 12 | E2E result"
       debug:
-        msg: |
-          ✅ Kong proxy test PASSED!
-          Request proxied successfully to {{ kong_test_backend_url }}
-          Response status: {{ proxy_test.status }}
+        msg: "PASSED — HTTP {{ e2e.status }} — Kong proxied to {{ svc_url }} successfully"
       tags: [test, e2e]
 
-    # -------------------------------------------------------------------------
-    # BLOCK 10: List all configured entities
-    # -------------------------------------------------------------------------
-    - name: List all services
+    - name: "STEP 12 | Auth test — no key (expect 401)"
+      uri:
+        url: "{{ kong_proxy_url }}{{ route_path }}/get"
+        method: GET
+        status_code: 401
+        timeout: 10
+      register: unauth
+      tags: [test, e2e]
+
+    - name: "STEP 12 | Auth enforcement result"
+      debug:
+        msg: "Key-auth WORKING — unauthenticated request blocked with HTTP {{ unauth.status }}"
+      tags: [test, e2e]
+
+    # ==========================================================
+    # STEP 13 — FINAL SUMMARY
+    # ==========================================================
+    - name: "STEP 13 | Fetch all services"
       uri:
         url: "{{ kong_admin_url }}/services"
-        method: GET
         return_content: yes
-      register: all_services
+      register: all_svc
       tags: [test, summary]
 
-    - name: List all routes
+    - name: "STEP 13 | Fetch all routes"
       uri:
         url: "{{ kong_admin_url }}/routes"
-        method: GET
         return_content: yes
       register: all_routes
       tags: [test, summary]
 
-    - name: List all plugins
+    - name: "STEP 13 | Fetch all plugins"
       uri:
         url: "{{ kong_admin_url }}/plugins"
-        method: GET
         return_content: yes
       register: all_plugins
       tags: [test, summary]
 
-    - name: Print summary
+    - name: "STEP 13 | FINAL SUMMARY"
       debug:
         msg: |
-          ============================================================
-          🦍 Kong API Gateway - Setup Summary
-          ============================================================
-          Admin API   : {{ kong_admin_url }}
-          Proxy       : {{ kong_proxy_url }}
-          Manager UI  : http://localhost:{{ kong_manager_port }}
 
-          Services    : {{ all_services.json.data | map(attribute='name') | list }}
-          Routes      : {{ all_routes.json.data | map(attribute='name') | list }}
-          Plugins     : {{ all_plugins.json.data | map(attribute='name') | list }}
-
-          Test URL    : {{ kong_proxy_url }}{{ kong_test_route_path }}/get
-          ============================================================
+          ╔═══════════════════════════════════════════════════════════╗
+          ║         Kong API Gateway — All Systems Go!               ║
+          ╠═══════════════════════════════════════════════════════════╣
+          ║  Version    : {{ health.json.version }}
+          ║  Proxy      : http://localhost:{{ kong_proxy_port }}
+          ║  Admin API  : http://localhost:{{ kong_admin_port }}
+          ║  Manager UI : http://localhost:{{ kong_manager_port }}
+          ╠═══════════════════════════════════════════════════════════╣
+          ║  Services : {{ all_svc.json.data | map(attribute='name') | list }}
+          ║  Routes   : {{ all_routes.json.data | map(attribute='name') | list }}
+          ║  Plugins  : {{ all_plugins.json.data | map(attribute='name') | list }}
+          ╠═══════════════════════════════════════════════════════════╣
+          ║  QUICK TEST COMMANDS                                     ║
+          ║                                                          ║
+          ║  # Authenticated request (expect 200)                   ║
+          ║  curl -i http://localhost:8000/test-api/get \           ║
+          ║       -H "apikey: my-local-test-key-2024"              ║
+          ║                                                          ║
+          ║  # No key (expect 401)                                  ║
+          ║  curl -i http://localhost:8000/test-api/get             ║
+          ║                                                          ║
+          ║  # Admin health                                         ║
+          ║  curl -s http://localhost:8001 | python3 -m json.tool   ║
+          ║                                                          ║
+          ║  systemctl status kong                                  ║
+          ║  journalctl -u kong -f                                  ║
+          ╚═══════════════════════════════════════════════════════════╝
       tags: [test, summary]
 
-  # ---------------------------------------------------------------------------
-  # HANDLERS
-  # ---------------------------------------------------------------------------
+  # ----------------------------------------------------------
   handlers:
-    - name: Reload systemd
+    - name: reload systemd
       systemd:
         daemon_reload: yes
-
-    - name: Restart Kong
-      service:
-        name: kong
-        state: restarted
