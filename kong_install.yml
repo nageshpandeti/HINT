@@ -15,12 +15,12 @@
     kong_conf: /etc/kong/kong.conf
     kong_proxy_port: 8000
     kong_admin_port: 8001
-    kong_admin_url: "http://localhost:8001"
-    kong_proxy_url: "http://localhost:8000"
+    kong_admin_url: "http://127.0.0.1:8001"
+    kong_proxy_url: "http://127.0.0.1:8000"
 
     mock_port: 9090
     svc_name: local-mock-service
-    svc_url: "http://localhost:9090"
+    svc_url: "http://127.0.0.1:9090"
     route_path: /test-api
     test_api_key: "my-local-test-key-2024"
 
@@ -30,13 +30,20 @@
         that: ansible_distribution == "Ubuntu"
         fail_msg: "This playbook requires Ubuntu"
 
-    - name: Kill apt locks and background jobs
+    - name: Stop apt background jobs and clear locks
       shell: |
         killall apt apt-get unattended-upgrades dpkg 2>/dev/null || true
         systemctl stop unattended-upgrades 2>/dev/null || true
         rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
         rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock
         dpkg --configure -a || true
+      changed_when: false
+
+    - name: Remove old Kong repo files
+      shell: |
+        rm -f /etc/apt/sources.list.d/kong*.list
+        rm -f /etc/apt/sources.list.d/kong*.sources
+        rm -f /usr/share/keyrings/kong-archive-keyring.gpg
       changed_when: false
 
     - name: Apt update
@@ -77,7 +84,8 @@
         su - postgres -c "psql -c \"CREATE USER {{ pg_user }} WITH PASSWORD '{{ pg_password }}' CREATEDB LOGIN;\""
       args:
         executable: /bin/bash
-      changed_when: true
+      register: create_user
+      changed_when: create_user.rc == 0
 
     - name: Create Kong database
       shell: |
@@ -85,34 +93,38 @@
         su - postgres -c "psql -c \"CREATE DATABASE {{ pg_db }} OWNER {{ pg_user }} ENCODING 'UTF8';\""
       args:
         executable: /bin/bash
-      changed_when: true
+      register: create_db
+      changed_when: create_db.rc == 0
 
     - name: Grant DB privileges
       shell: |
         su - postgres -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE {{ pg_db }} TO {{ pg_user }};\""
       changed_when: false
 
-    - name: Remove any old mock process
+    - name: Kill old mock backend processes
       shell: |
+        pkill -f /tmp/mock_server.py 2>/dev/null || true
         fuser -k {{ mock_port }}/tcp 2>/dev/null || true
-        rm -f /tmp/mock_server.pid
+        rm -f /tmp/mock_server.pid /tmp/mock_server.log
+        sleep 2
       changed_when: false
 
-    - name: Create local mock backend
+    - name: Create mock server script
       copy:
         dest: /tmp/mock_server.py
         mode: "0755"
         content: |
           #!/usr/bin/env python3
-          from http.server import HTTPServer, BaseHTTPRequestHandler
-          import json, datetime
+          from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+          import json
+          import datetime
 
           class Handler(BaseHTTPRequestHandler):
-              def do_GET(self):
+              def _reply(self):
                   body = json.dumps({
                       "status": "ok",
                       "path": self.path,
-                      "method": "GET",
+                      "method": self.command,
                       "message": "Kong API Gateway mock backend",
                       "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
                   }).encode("utf-8")
@@ -122,19 +134,24 @@
                   self.end_headers()
                   self.wfile.write(body)
 
-              def do_POST(self):
-                  self.do_GET()
+              def do_GET(self):
+                  self._reply()
 
-              def log_message(self, fmt, *args):
+              def do_POST(self):
+                  self._reply()
+
+              def log_message(self, format, *args):
                   return
 
           if __name__ == "__main__":
-              HTTPServer(("0.0.0.0", {{ mock_port }}), Handler).serve_forever()
+              server = ThreadingHTTPServer(("127.0.0.1", {{ mock_port }}), Handler)
+              server.serve_forever()
 
     - name: Start mock backend
       shell: |
         nohup python3 /tmp/mock_server.py >/tmp/mock_server.log 2>&1 &
         echo $! >/tmp/mock_server.pid
+        sleep 3
       args:
         executable: /bin/bash
       changed_when: true
@@ -143,11 +160,12 @@
       wait_for:
         host: 127.0.0.1
         port: "{{ mock_port }}"
-        timeout: 15
+        delay: 1
+        timeout: 20
 
     - name: Verify mock backend
       uri:
-        url: "http://127.0.0.1:{{ mock_port }}/health"
+        url: "http://127.0.0.1:{{ mock_port }}/"
         method: GET
         status_code: 200
         return_content: yes
@@ -166,7 +184,7 @@
         content: |
           deb [signed-by=/usr/share/keyrings/kong-archive-keyring.gpg] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
 
-    - name: Update apt after Kong repo
+    - name: Update apt after adding Kong repo
       apt:
         update_cache: yes
       changed_when: false
@@ -181,9 +199,10 @@
       register: kong_bin
       changed_when: false
 
-    - name: Show Kong binary
-      debug:
-        msg: "Using Kong binary: {{ kong_bin.stdout }}"
+    - name: Show Kong version
+      command: kong version
+      register: kong_ver
+      changed_when: false
 
     - name: Copy default kong.conf
       copy:
@@ -192,6 +211,11 @@
         remote_src: true
         force: false
         mode: "0644"
+
+    - name: Remove old Ansible-managed block
+      shell: |
+        sed -i '/# BEGIN ANSIBLE MANAGED BLOCK/,/# END ANSIBLE MANAGED BLOCK/d' {{ kong_conf }} || true
+      changed_when: false
 
     - name: Configure kong.conf
       blockinfile:
@@ -235,7 +259,7 @@
           ExecStartPre={{ kong_bin.stdout }} prepare -p /usr/local/kong -c {{ kong_conf }}
           ExecStart={{ kong_bin.stdout }} start -c {{ kong_conf }}
           ExecReload={{ kong_bin.stdout }} reload -c {{ kong_conf }}
-          ExecStop={{ kong_bin.stdout }} stop -c {{ kong_conf }}
+          ExecStop={{ kong_bin.stdout }} stop
           Restart=on-failure
           RestartSec=5s
 
@@ -356,31 +380,34 @@
           key: "{{ test_api_key }}"
         status_code: [200, 201]
 
-    - name: E2E authenticated request
+    - name: Authenticated E2E request
       uri:
         url: "{{ kong_proxy_url }}{{ route_path }}/hello"
         method: GET
         headers:
           apikey: "{{ test_api_key }}"
         status_code: 200
+        timeout: 15
         return_content: yes
       register: e2e
 
-    - name: E2E unauthenticated request
+    - name: Unauthenticated E2E request
       uri:
         url: "{{ kong_proxy_url }}{{ route_path }}/hello"
         method: GET
         status_code: 401
+        timeout: 10
       register: unauth
 
-    - name: Summary
+    - name: Final summary
       debug:
         msg:
-          - "Kong version: {{ health.json.version }}"
-          - "Proxy URL: {{ kong_proxy_url }}"
-          - "Admin URL: {{ kong_admin_url }}"
-          - "Mock backend: http://127.0.0.1:{{ mock_port }}"
+          - "Kong version: {{ kong_ver.stdout }}"
+          - "Admin API: {{ kong_admin_url }}"
+          - "Proxy: {{ kong_proxy_url }}"
+          - "Mock backend: http://127.0.0.1:{{ mock_port }}/"
+          - "Mock verify: HTTP {{ mock_check.status }}"
           - "Route: {{ route_path }}"
-          - "Authenticated test: HTTP {{ e2e.status }}"
-          - "Unauthenticated test: HTTP {{ unauth.status }}"
+          - "Authenticated request: HTTP {{ e2e.status }}"
+          - "Unauthenticated request: HTTP {{ unauth.status }}"
           - "API key: {{ test_api_key }}"
