@@ -1,111 +1,145 @@
 #!/bin/bash
 # ============================================================
-# FILE: disk_cleanup.sh
-# RUN:  sudo bash disk_cleanup.sh
-# PURPOSE: Free disk space - targets /var (40G) and /snap (1.2G)
+# FILE: uninstall_postgres_and_clean.sh
+# RUN:  sudo bash uninstall_postgres_and_clean.sh
+# PURPOSE:
+#   1. Uninstall PostgreSQL completely
+#   2. Clean /var/cache/apt/archives (all .deb files)
+#   3. Free up disk space for Kong DB-Less install
 # ============================================================
 
 GREEN='\033[0;32m'; CYAN='\033[0;36m'
-YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+RED='\033[0;31m'; YELLOW='\033[1;33m'
+BOLD='\033[1m'; NC='\033[0m'
 
 log()  { echo -e "${GREEN}[OK]${NC}  $1"; }
 info() { echo -e "${CYAN}[..]${NC}  $1"; }
 warn() { echo -e "${YELLOW}[!]${NC}   $1"; }
 
-[[ $EUID -ne 0 ]] && { echo "Run: sudo bash disk_cleanup.sh"; exit 1; }
+[[ $EUID -ne 0 ]] && { echo "Run: sudo bash uninstall_postgres_and_clean.sh"; exit 1; }
 
 echo -e "${BOLD}${CYAN}"
 echo "========================================================"
-echo "  Disk Cleanup — targeting /var (40G) + /snap (1.2G)"
+echo "  Uninstall PostgreSQL + Clean APT Cache"
 echo "========================================================"
 echo -e "${NC}"
 
 FREE_BEFORE=$(df -h / | tail -1 | awk '{print $4}')
 echo "  Disk free BEFORE: $FREE_BEFORE"
+echo "  APT cache size:   $(du -sh /var/cache/apt/archives/ | awk '{print $1}')"
 echo ""
 
-# ── 1. APT cache ─────────────────────────────────────────────
-info "Cleaning APT cache..."
+# ============================================================
+# STEP 1 — STOP POSTGRESQL SERVICE
+# ============================================================
+info "Step 1: Stopping PostgreSQL service..."
+systemctl stop postgresql   2>/dev/null || true
+systemctl disable postgresql 2>/dev/null || true
+log "PostgreSQL service stopped"
+
+# ============================================================
+# STEP 2 — UNINSTALL POSTGRESQL COMPLETELY
+# ============================================================
+info "Step 2: Removing PostgreSQL packages..."
+export DEBIAN_FRONTEND=noninteractive
+
+# Remove all postgresql packages
+apt-get purge -y \
+    postgresql \
+    postgresql-14 \
+    postgresql-15 \
+    postgresql-16 \
+    postgresql-client \
+    postgresql-client-14 \
+    postgresql-client-common \
+    postgresql-common \
+    postgresql-contrib \
+    'postgresql-*' \
+    2>&1 | tail -5 || true
+
+apt-get autoremove -y 2>&1 | tail -3 || true
+log "PostgreSQL packages removed"
+
+# ============================================================
+# STEP 3 — REMOVE POSTGRESQL DATA AND CONFIG DIRS
+# ============================================================
+info "Step 3: Removing PostgreSQL data directories..."
+rm -rf /var/lib/postgresql/  && log "Removed /var/lib/postgresql/"
+rm -rf /var/log/postgresql/  && log "Removed /var/log/postgresql/"
+rm -rf /etc/postgresql/      && log "Removed /etc/postgresql/"
+rm -rf /etc/postgresql-common/ 2>/dev/null || true
+
+# ============================================================
+# STEP 4 — CLEAN ALL CACHED .DEB FILES
+# ============================================================
+info "Step 4: Cleaning /var/cache/apt/archives/..."
+echo "  Removing all cached .deb packages:"
+ls /var/cache/apt/archives/*.deb 2>/dev/null | wc -l | \
+    xargs -I{} echo "  Found {} .deb files to remove"
+
+rm -f /var/cache/apt/archives/*.deb
+rm -f /var/cache/apt/archives/partial/*
 apt-get clean
 apt-get autoclean
-apt-get autoremove -y 2>/dev/null || true
-rm -rf /var/cache/apt/archives/*.deb 2>/dev/null || true
-rm -rf /var/cache/apt/archives/partial/* 2>/dev/null || true
-FREED=$(du -sh /var/cache/apt 2>/dev/null | awk '{print $1}')
-log "APT cache cleaned"
+log "APT cache cleared"
 
-# ── 2. Journal logs ───────────────────────────────────────────
-info "Truncating journal logs (keep last 50MB)..."
+# ============================================================
+# STEP 5 — CLEAN OTHER LARGE /var FILES
+# ============================================================
+info "Step 5: Cleaning other large files in /var..."
+
+# Journal logs
 journalctl --vacuum-size=50M 2>/dev/null || true
-journalctl --vacuum-time=2d  2>/dev/null || true
-log "Journal logs cleaned: $(du -sh /var/log/journal 2>/dev/null | awk '{print $1}')"
+journalctl --vacuum-time=3d  2>/dev/null || true
+find /var/log -name "*.gz" -delete  2>/dev/null || true
+find /var/log -name "*.old" -delete 2>/dev/null || true
+find /var/log -name "*.1" -delete   2>/dev/null || true
+log "Journal and old logs cleaned"
 
-# ── 3. Old system logs ────────────────────────────────────────
-info "Removing old /var/log files..."
-find /var/log -name "*.gz"    -delete 2>/dev/null || true
-find /var/log -name "*.1"     -delete 2>/dev/null || true
-find /var/log -name "*.old"   -delete 2>/dev/null || true
-find /var/log -name "*-????????" -delete 2>/dev/null || true
-log "Old log files removed"
+# Crash reports
+rm -rf /var/crash/* 2>/dev/null || true
+log "Crash reports removed"
 
-# ── 4. Snap cleanup ───────────────────────────────────────────
-info "Cleaning snap (removing disabled/old revisions)..."
+# Snap old revisions
 if command -v snap &>/dev/null; then
-    # Remove disabled snap revisions
     snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' | \
     while read -r name rev; do
-        snap remove "$name" --revision="$rev" 2>/dev/null && \
-            echo "  Removed snap: $name rev $rev" || true
+        snap remove "$name" --revision="$rev" 2>/dev/null || true
     done
-
-    # Clear snap cache
     rm -rf /var/lib/snapd/cache/* 2>/dev/null || true
-
-    SNAP_SIZE=$(du -sh /snap 2>/dev/null | awk '{print $1}')
-    log "Snap cleaned — current size: $SNAP_SIZE"
-else
-    warn "Snap not installed — skipping"
+    log "Snap old revisions cleaned"
 fi
 
-# ── 5. Old kernels ────────────────────────────────────────────
-info "Removing old kernels..."
+# Old kernels
 CURRENT=$(uname -r)
-echo "  Keeping current kernel: $CURRENT"
-OLD_KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | grep "^ii" | \
+dpkg -l 'linux-image-*' 2>/dev/null | grep "^ii" | \
     grep -v "$CURRENT" | grep -v "linux-image-generic" | \
-    awk '{print $2}')
-if [[ -n "$OLD_KERNELS" ]]; then
-    echo "$OLD_KERNELS" | xargs apt-get purge -y 2>/dev/null || true
-    log "Old kernels removed"
+    awk '{print $2}' | \
+    xargs -r apt-get purge -y 2>/dev/null || true
+log "Old kernels removed (kept: $CURRENT)"
+
+# ============================================================
+# STEP 6 — VERIFY POSTGRESQL IS GONE
+# ============================================================
+info "Step 6: Verifying PostgreSQL is fully removed..."
+
+if dpkg -l postgresql 2>/dev/null | grep -q "^ii"; then
+    warn "PostgreSQL still shows as installed — forcing removal..."
+    dpkg --purge postgresql 2>/dev/null || true
 else
-    log "No old kernels to remove"
+    log "PostgreSQL: NOT installed (confirmed)"
 fi
 
-# ── 6. /var/lib/docker cleanup (if Docker installed) ─────────
-if command -v docker &>/dev/null; then
-    info "Cleaning Docker cache..."
-    docker system prune -af --volumes 2>/dev/null || true
-    log "Docker cleaned"
+if [[ -d /var/lib/postgresql ]]; then
+    warn "/var/lib/postgresql still exists — removing..."
+    rm -rf /var/lib/postgresql
+else
+    log "/var/lib/postgresql: removed"
 fi
 
-# ── 7. Temp files ─────────────────────────────────────────────
-info "Cleaning temp files..."
-rm -rf /tmp/*.deb /tmp/*.tar.gz /tmp/*.zip 2>/dev/null || true
-rm -rf /var/tmp/*.deb 2>/dev/null || true
-log "Temp files cleaned"
-
-# ── 8. Thumbnail/crash caches ────────────────────────────────
-info "Clearing crash reports and thumbnails..."
-rm -rf /var/crash/* 2>/dev/null || true
-rm -rf /home/*/.cache/thumbnails/* 2>/dev/null || true
-log "Crash reports cleared"
-
-# ── Check /var breakdown ─────────────────────────────────────
-echo ""
-info "What's inside /var now:"
-du -sh /var/* 2>/dev/null | sort -rh | head -10
-
-# ── Final result ─────────────────────────────────────────────
+# ============================================================
+# STEP 7 — SHOW DISK SPACE FREED
+# ============================================================
 FREE_AFTER=$(df -h / | tail -1 | awk '{print $4}')
 FREE_AFTER_MB=$(df / | tail -1 | awk '{print int($4/1024)}')
 
@@ -115,27 +149,30 @@ echo "========================================================"
 echo "  Cleanup Complete"
 echo "========================================================"
 echo -e "${NC}"
-printf "  %-20s %s\n" "Free before:" "$FREE_BEFORE"
-printf "  %-20s %s\n" "Free after:"  "$FREE_AFTER"
-echo ""
 
-df -h /
-echo ""
+printf "  %-25s %s\n" "Disk free before:"  "$FREE_BEFORE"
+printf "  %-25s %s\n" "Disk free after:"   "$FREE_AFTER"
+printf "  %-25s %s\n" "PostgreSQL:"        "UNINSTALLED"
+printf "  %-25s %s\n" "APT cache:"         "$(du -sh /var/cache/apt/archives/ | awk '{print $1}')"
 
-if [[ "$FREE_AFTER_MB" -gt 2000 ]]; then
-    echo -e "${GREEN}Enough space to install Kong. Run:${NC}"
+echo ""
+echo "  Top space users now:"
+du -sh /var/* 2>/dev/null | sort -rh | head -8 | \
+    while read -r size path; do
+        printf "    %-10s %s\n" "$size" "$path"
+    done
+
+echo ""
+if [[ "$FREE_AFTER_MB" -gt 1000 ]]; then
+    echo -e "${GREEN}${BOLD}Enough space freed! Next steps:${NC}"
+    echo ""
+    echo "  # Install Kong dependencies:"
     echo "  sudo bash kongo-pre-requisites.sh"
-elif [[ "$FREE_AFTER_MB" -gt 500 ]]; then
-    echo -e "${YELLOW}Marginal space (${FREE_AFTER_MB}MB). May be enough. Run:${NC}"
-    echo "  sudo bash kongo-pre-requisites.sh"
+    echo ""
+    echo "  # Run Kong DB-Less playbook:"
+    echo "  ansible-playbook kong_dbless.yml -v"
 else
-    echo -e "${YELLOW}${BOLD}Still low (${FREE_AFTER_MB}MB). Check /var breakdown above.${NC}"
-    echo ""
-    echo "If /var/lib/... is the culprit, check:"
-    echo "  du -sh /var/lib/* | sort -rh | head -10"
-    echo ""
-    echo "To resize the VirtualBox disk instead:"
-    echo "  1. Power off VM"
-    echo "  2. VirtualBox → File → Virtual Media Manager → select disk → resize"
-    echo "  3. Boot VM and run: sudo growpart /dev/sda 1 && sudo resize2fs /dev/sda1"
+    echo -e "${YELLOW}${BOLD}Still low on space (${FREE_AFTER_MB}MB).${NC}"
+    echo "  Check what else is large:"
+    echo "  sudo du -sh /var/lib/* 2>/dev/null | sort -rh | head -10"
 fi
