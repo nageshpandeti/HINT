@@ -1,0 +1,83 @@
+---
+
+* name: Install and Run Kong (DB-less Full Setup)
+  hosts: localhost
+  connection: local
+  become: yes
+  gather_facts: yes
+
+  vars:
+  kong_container_name: kong
+  kong_image: kong:3.6
+
+  tasks:
+
+  * name: Update apt cache
+    apt:
+    update_cache: yes
+
+  * name: Install required packages
+    apt:
+    name:
+    - docker.io
+    - python3-pip
+    state: present
+
+  * name: Install Docker Python module
+    pip:
+    name: docker
+
+  * name: Start and enable Docker
+    service:
+    name: docker
+    state: started
+    enabled: yes
+
+  * name: Remove old Kong container if exists
+    community.docker.docker_container:
+    name: "{{ kong_container_name }}"
+    state: absent
+    ignore_errors: yes
+
+  * name: Pull Kong Docker image
+    community.docker.docker_image:
+    name: "{{ kong_image }}"
+    source: pull
+
+  * name: Run Kong container (DB-less mode)
+    community.docker.docker_container:
+    name: "{{ kong_container_name }}"
+    image: "{{ kong_image }}"
+    state: started
+    restart_policy: always
+    ports:
+    - "8000:8000"
+    - "8001:8001"
+    env:
+    KONG_DATABASE: "off"
+    KONG_PROXY_ACCESS_LOG: /dev/stdout
+    KONG_ADMIN_ACCESS_LOG: /dev/stdout
+    KONG_PROXY_ERROR_LOG: /dev/stderr
+    KONG_ADMIN_ERROR_LOG: /dev/stderr
+    KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+
+  * name: Wait for Kong Admin API to be ready
+    wait_for:
+    host: localhost
+    port: 8001
+    delay: 5
+    timeout: 60
+
+  * name: Check Kong Admin API
+    uri:
+    url: http://localhost:8001
+    method: GET
+    return_content: yes
+    register: kong_status
+    retries: 5
+    delay: 5
+    until: kong_status.status == 200
+
+  * name: Display Kong API response
+    debug:
+    var: kong_status.json
