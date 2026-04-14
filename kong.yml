@@ -1,610 +1,76 @@
 ---
-# ================================================================
-# FILE : kong_ansible.yml
-# RUN  : ansible-playbook kong_ansible.yml -v
-# ================================================================
-
-- name: Kong API Gateway — DB-Less Install and Test
+- name: Setup and Run Kong (DB-less)
   hosts: localhost
   connection: local
-  become: true
-  become_method: sudo
-  gather_facts: true
+  become: yes
+  gather_facts: yes
 
   vars:
-    kong_conf:       /etc/kong/kong.conf
-    kong_yml:        /etc/kong/kong.yml
-    kong_proxy_port: 8000
-    kong_admin_port: 8001
-    kong_admin_url:  "http://localhost:8001"
-    kong_proxy_url:  "http://localhost:8000"
-    mock_port:       9090
-    api_key:         "my-local-test-key-2024"
-    admin_key:       "admin-secret-key-2024"
+    kong_container_name: kong
+    kong_image: kong:3.6
 
-  # ============================================================
-  pre_tasks:
-
-    - name: System info
-      debug:
-        msg: "Ubuntu {{ ansible_distribution_version }} ({{ ansible_distribution_release }}) | RAM {{ ansible_memtotal_mb }}MB"
-      tags: always
-
-    - name: "PRE | Verify libopenssl"
-      shell: dpkg -l libssl-dev | grep "^ii"
-      register: chk_ssl
-      changed_when: false
-      failed_when: chk_ssl.rc != 0
-      tags: always
-
-    - name: "PRE | Verify zlib"
-      shell: dpkg -l zlib1g | grep "^ii"
-      register: chk_zlib
-      changed_when: false
-      failed_when: chk_zlib.rc != 0
-      tags: always
-
-    - name: "PRE | Verify libpcre"
-      shell: dpkg -l libpcre3 | grep "^ii"
-      register: chk_pcre
-      changed_when: false
-      failed_when: chk_pcre.rc != 0
-      tags: always
-
-    - name: "PRE | All native deps confirmed"
-      debug:
-        msg:
-          - "libopenssl : {{ chk_ssl.stdout.split()[2] }}"
-          - "zlib       : {{ chk_zlib.stdout.split()[2] }}"
-          - "libpcre    : {{ chk_pcre.stdout.split()[2] }}"
-      tags: always
-
-  # ============================================================
   tasks:
 
-    # ==========================================================
-    # STEP 1 — INSTALL KONG (skip if already installed)
-    # ==========================================================
-    - name: "STEP 1 | Check if Kong already installed"
-      command: which kong
-      register: kong_bin
-      changed_when: false
-      failed_when: false
-      tags: [install]
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+        update_cache: yes
 
-    - name: "STEP 1 | Show existing Kong version"
-      command: kong version
-      register: kong_existing
-      changed_when: false
-      when: kong_bin.rc == 0
-      tags: [install]
+    - name: Install docker python module
+      pip:
+        name: docker
 
-    - name: "STEP 1 | Kong already present — skipping install"
-      debug:
-        msg: "{{ kong_existing.stdout }}"
-      when: kong_bin.rc == 0
-      tags: [install]
-
-    - name: "STEP 1 | Remove stale Kong repo files"
-      shell: |
-        rm -f /etc/apt/sources.list.d/kong*.list
-        rm -f /etc/apt/sources.list.d/kong*.sources
-        rm -f /usr/share/keyrings/kong*.gpg
-        rm -f /usr/share/keyrings/kong*.asc
-        rm -f /etc/apt/trusted.gpg.d/kong*.gpg
-      changed_when: false
-      when: kong_bin.rc != 0
-      tags: [install]
-
-    - name: "STEP 1 | Import Kong GPG key"
-      shell: |
-        curl -fsSL \
-          https://packages.konghq.com/public/gateway-39/gpg.E7ECF02AC16C5DB8.key \
-          -o /tmp/kong.gpg.key
-        gpg --dearmor < /tmp/kong.gpg.key \
-          > /usr/share/keyrings/kong-archive-keyring.gpg
-        rm -f /tmp/kong.gpg.key
-      when: kong_bin.rc != 0
-      changed_when: true
-      tags: [install]
-
-    - name: "STEP 1 | Add Kong APT repo"
-      copy:
-        dest: /etc/apt/sources.list.d/kong-gateway-39.list
-        content: |
-          deb [signed-by=/usr/share/keyrings/kong-archive-keyring.gpg] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
-      when: kong_bin.rc != 0
-      tags: [install]
-
-    - name: "STEP 1 | apt update"
-      shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
-      when: kong_bin.rc != 0
-      changed_when: false
-      failed_when: false
-      tags: [install]
-
-    - name: "STEP 1 | Check Kong in apt cache"
-      shell: apt-cache show kong 2>&1 | head -3
-      register: kong_cache
-      when: kong_bin.rc != 0
-      changed_when: false
-      failed_when: false
-      tags: [install]
-
-    - name: "STEP 1 | Fallback — trusted=yes repo"
-      copy:
-        dest: /etc/apt/sources.list.d/kong-gateway-39.list
-        content: |
-          deb [trusted=yes] https://packages.konghq.com/public/gateway-39/deb/ubuntu {{ ansible_distribution_release }} main
-      when:
-        - kong_bin.rc != 0
-        - kong_cache is defined
-        - "'Package: kong' not in (kong_cache.stdout | default(''))"
-      tags: [install]
-
-    - name: "STEP 1 | apt update after fallback repo"
-      shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
-      when:
-        - kong_bin.rc != 0
-        - kong_cache is defined
-        - "'Package: kong' not in (kong_cache.stdout | default(''))"
-      changed_when: false
-      tags: [install]
-
-    - name: "STEP 1 | Install Kong package"
-      shell: export DEBIAN_FRONTEND=noninteractive && apt-get install -y kong 2>&1
-      when: kong_bin.rc != 0
-      changed_when: true
-      tags: [install]
-
-    - name: "STEP 1 | Kong version"
-      command: kong version
-      register: kong_ver
-      changed_when: false
-      tags: [install]
-
-    - name: "STEP 1 | Version confirmed"
-      debug:
-        msg: "{{ kong_ver.stdout }}"
-      tags: [install]
-
-    # ==========================================================
-    # STEP 2 — MOCK BACKEND (kill old + write new + restart)
-    # ==========================================================
-
-    # ── kill everything on port 9090 cleanly ─────────────────
-    - name: "STEP 2 | Stop kong-mock systemd service"
-      systemd:
-        name: kong-mock
-        state: stopped
-      failed_when: false
-      tags: [mock]
-
-    - name: "STEP 2 | Force kill any process on port {{ mock_port }}"
-      shell: |
-        fuser -k {{ mock_port }}/tcp 2>/dev/null || true
-        sleep 2
-        fuser -k {{ mock_port }}/tcp 2>/dev/null || true
-      changed_when: false
-      tags: [mock]
-
-    - name: "STEP 2 | Confirm port {{ mock_port }} is free"
-      shell: |
-        if fuser {{ mock_port }}/tcp 2>/dev/null; then
-          echo "PORT STILL IN USE"
-          exit 1
-        else
-          echo "Port {{ mock_port }} is free"
-        fi
-      register: port_check
-      changed_when: false
-      tags: [mock]
-
-    - name: "STEP 2 | Port status"
-      debug:
-        msg: "{{ port_check.stdout }}"
-      tags: [mock]
-
-    # ── write the NEW mock script ─────────────────────────────
-    - name: "STEP 2 | Write NEW mock backend script"
-      copy:
-        dest: /opt/kong-mock-server.py
-        mode: "0755"
-        # Returns HTTP 200 for EVERY path — no route matching needed
-        content: |
-          #!/usr/bin/env python3
-          from http.server import HTTPServer, BaseHTTPRequestHandler
-          import json, datetime, random, urllib.parse
-
-          class Handler(BaseHTTPRequestHandler):
-              def do_GET(self):
-                  path = urllib.parse.urlparse(self.path).path
-                  seg  = path.strip("/").split("/")[-1] if path.strip("/") else "root"
-                  payloads = {
-                      "hello":   {"message": "Hello from Kong DB-Less!"},
-                      "health":  {"status": "ok", "db": "none"},
-                      "users":   {"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]},
-                      "orders":  {"orders": [{"id": 101, "item": "Widget"}]},
-                      "metrics": {"rps": random.randint(10,50), "p99_ms": random.randint(1,20)},
-                      "root":    {"message": "mock root ok"},
-                  }
-                  body = json.dumps({
-                      **payloads.get(seg, {"message": "ok", "path": path}),
-                      "path": self.path,
-                      "mode": "db-less",
-                      "ts":   datetime.datetime.utcnow().isoformat() + "Z",
-                  }, indent=2).encode()
-                  self.send_response(200)
-                  self.send_header("Content-Type",   "application/json")
-                  self.send_header("Content-Length", str(len(body)))
-                  self.send_header("Access-Control-Allow-Origin", "*")
-                  self.end_headers()
-                  self.wfile.write(body)
-              def do_OPTIONS(self):
-                  self.send_response(200)
-                  self.send_header("Access-Control-Allow-Origin",  "*")
-                  self.send_header("Access-Control-Allow-Headers", "*")
-                  self.end_headers()
-              def log_message(self, fmt, *args):
-                  pass
-
-          if __name__ == "__main__":
-              print("Mock backend :9090 — 200 for all paths")
-              HTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
-      tags: [mock]
-
-    # ── create / overwrite systemd unit ──────────────────────
-    - name: "STEP 2 | Write mock systemd unit"
-      copy:
-        dest: /lib/systemd/system/kong-mock.service
-        mode: "0644"
-        content: |
-          [Unit]
-          Description=Kong Mock Backend
-          After=network.target
-
-          [Service]
-          ExecStart=/usr/bin/python3 /opt/kong-mock-server.py
-          Restart=always
-          StandardOutput=journal
-          StandardError=journal
-
-          [Install]
-          WantedBy=multi-user.target
-      tags: [mock]
-
-    - name: "STEP 2 | Reload systemd daemon"
-      systemd:
-        daemon_reload: yes
-      tags: [mock]
-
-    - name: "STEP 2 | Start mock backend fresh"
-      systemd:
-        name: kong-mock
-        state: started
-        enabled: yes
-      tags: [mock]
-
-    - name: "STEP 2 | Wait for port {{ mock_port }} to open"
-      wait_for:
-        host: localhost
-        port: "{{ mock_port }}"
-        delay: 2
-        timeout: 20
-      tags: [mock]
-
-    # ── verify with curl, not uri module ─────────────────────
-    - name: "STEP 2 | Verify mock backend with curl"
-      shell: |
-        curl -s -o /tmp/mock_test.txt \
-             -w "%{http_code}" \
-             --max-time 5 \
-             http://localhost:{{ mock_port }}/ping
-      register: mock_curl
-      changed_when: false
-      tags: [mock]
-
-    - name: "STEP 2 | Mock backend HTTP status"
-      debug:
-        msg: "Mock backend returned HTTP {{ mock_curl.stdout }} ✔"
-      tags: [mock]
-
-    - name: "STEP 2 | Fail if mock not returning 200"
-      fail:
-        msg: "Mock backend returned HTTP {{ mock_curl.stdout }} — expected 200"
-      when: mock_curl.stdout != "200"
-      tags: [mock]
-
-    # ==========================================================
-    # STEP 3 — WRITE kong.conf
-    # ==========================================================
-    - name: "STEP 3 | Stop Kong if running"
+    - name: Start and enable docker
       service:
-        name: kong
-        state: stopped
-      failed_when: false
-      tags: [configure]
-
-    - name: "STEP 3 | Write kong.conf (DB-Less)"
-      copy:
-        dest: "{{ kong_conf }}"
-        owner: root
-        mode: "0644"
-        content: |
-          database           = off
-          declarative_config = {{ kong_yml }}
-          proxy_listen       = 0.0.0.0:{{ kong_proxy_port }}
-          admin_listen       = 0.0.0.0:{{ kong_admin_port }}
-          log_level          = notice
-          proxy_access_log   = /dev/stdout
-          proxy_error_log    = /dev/stderr
-          admin_access_log   = /dev/stdout
-          admin_error_log    = /dev/stderr
-      tags: [configure]
-
-    # ==========================================================
-    # STEP 4 — WRITE kong.yml
-    # ==========================================================
-    - name: "STEP 4 | Write kong.yml"
-      copy:
-        dest: "{{ kong_yml }}"
-        owner: root
-        mode: "0644"
-        content: |
-          _format_version: "3.0"
-          _transform: true
-
-          services:
-            - name: mock-service
-              url: http://localhost:{{ mock_port }}
-              connect_timeout: 5000
-              read_timeout:    10000
-              routes:
-                - name: test-route
-                  paths: [/test-api]
-                  strip_path: true
-                  methods: [GET, POST]
-                - name: api-route
-                  paths: [/api]
-                  strip_path: true
-                  methods: [GET, POST]
-
-            - name: health-service
-              url: http://localhost:{{ mock_port }}
-              routes:
-                - name: health-route
-                  paths: [/health]
-                  strip_path: false
-                  methods: [GET]
-
-          consumers:
-            - username: test-user
-              keyauth_credentials:
-                - key: "{{ api_key }}"
-            - username: admin-user
-              keyauth_credentials:
-                - key: "{{ admin_key }}"
-
-          plugins:
-            - name: key-auth
-              config:
-                key_names: [apikey, x-api-key]
-                hide_credentials: true
-            - name: rate-limiting
-              config:
-                minute: 30
-                hour:   500
-                policy: local
-      tags: [configure]
-
-    # ==========================================================
-    # STEP 5 — VALIDATE + START KONG
-    # ==========================================================
-    - name: "STEP 5 | Validate kong.yml"
-      command: kong config parse {{ kong_yml }}
-      register: parse_out
-      changed_when: false
-      tags: [configure]
-
-    - name: "STEP 5 | Config valid"
-      debug:
-        msg: "{{ parse_out.stdout | default('kong.yml syntax OK') }}"
-      tags: [configure]
-
-    - name: "STEP 6 | Create Kong systemd unit"
-      copy:
-        dest: /lib/systemd/system/kong.service
-        owner: root
-        mode: "0644"
-        content: |
-          [Unit]
-          Description=Kong API Gateway (DB-Less)
-          After=network.target
-
-          [Service]
-          User=root
-          Group=root
-          Type=forking
-          ExecStartPre=/usr/local/bin/kong prepare -p /usr/local/kong -c /etc/kong/kong.conf
-          ExecStart=/usr/local/bin/kong start   -c /etc/kong/kong.conf
-          ExecReload=/usr/local/bin/kong reload -c /etc/kong/kong.conf
-          ExecStop=/usr/local/bin/kong  stop
-          Restart=on-failure
-          RestartSec=5s
-
-          [Install]
-          WantedBy=multi-user.target
-      tags: [start]
-
-    - name: "STEP 6 | Start Kong"
-      systemd:
-        name: kong
-        daemon_reload: yes
+        name: docker
         state: started
         enabled: yes
-      tags: [start]
 
-    - name: "STEP 6 | Wait for Admin API :{{ kong_admin_port }}"
+    - name: Pull Kong image
+      community.docker.docker_image:
+        name: "{{ kong_image }}"
+        source: pull
+
+    - name: Run Kong container (DB-less mode)
+      community.docker.docker_container:
+        name: "{{ kong_container_name }}"
+        image: "{{ kong_image }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "8000:8000"
+          - "8443:8443"
+          - "8001:8001"
+          - "8444:8444"
+        env:
+          KONG_DATABASE: "off"
+          KONG_DECLARATIVE_CONFIG: "/kong/declarative/kong.yml"
+          KONG_PROXY_ACCESS_LOG: /dev/stdout
+          KONG_ADMIN_ACCESS_LOG: /dev/stdout
+          KONG_PROXY_ERROR_LOG: /dev/stderr
+          KONG_ADMIN_ERROR_LOG: /dev/stderr
+          KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+        command: "kong start"
+
+    - name: Wait for Kong to start
       wait_for:
         host: localhost
-        port: "{{ kong_admin_port }}"
+        port: 8001
         delay: 5
         timeout: 60
-      tags: [start]
 
-    - name: "STEP 6 | Wait for Proxy :{{ kong_proxy_port }}"
-      wait_for:
-        host: localhost
-        port: "{{ kong_proxy_port }}"
-        delay: 2
-        timeout: 30
-      tags: [start]
-
-    # ==========================================================
-    # STEP 7 — HEALTH CHECK
-    # ==========================================================
-    - name: "STEP 7 | Admin API health"
+    - name: Check Kong Admin API
       uri:
-        url: "{{ kong_admin_url }}"
+        url: http://localhost:8001
         method: GET
-        status_code: 200
-        return_content: yes
-      register: health
-      tags: [start, test]
+      register: kong_status
+      retries: 5
+      delay: 5
+      until: kong_status.status == 200
 
-    - name: "STEP 7 | Confirm DB-Less mode"
+    - name: Display Kong status
       debug:
-        msg: "Kong v{{ health.json.version }} | database={{ health.json.configuration.database }} ✔"
-      tags: [start, test]
-
-    - name: "STEP 7 | Fail if not DB-Less"
-      fail:
-        msg: "Kong database={{ health.json.configuration.database }} (expected off)"
-      when: health.json.configuration.database != 'off'
-      tags: [start, test]
-
-    # ==========================================================
-    # STEP 8 — E2E TESTS
-    # ==========================================================
-    - name: "STEP 8 | TEST 1 — no key (expect 401)"
-      uri:
-        url: "{{ kong_proxy_url }}/test-api/hello"
-        method: GET
-        status_code: 401
-        timeout: 10
-      register: t1
-      tags: [test]
-
-    - name: "STEP 8 | TEST 1 PASSED"
-      debug:
-        msg: "No key → HTTP {{ t1.status }} ✔"
-      tags: [test]
-
-    - name: "STEP 8 | TEST 2 — with key (expect 200)"
-      uri:
-        url: "{{ kong_proxy_url }}/test-api/hello"
-        method: GET
-        headers:
-          apikey: "{{ api_key }}"
-        status_code: 200
-        timeout: 15
-        return_content: yes
-      register: t2
-      tags: [test]
-
-    - name: "STEP 8 | TEST 2 PASSED"
-      debug:
-        msg: "With key → HTTP {{ t2.status }} | {{ t2.json.message | default('ok') }} ✔"
-      tags: [test]
-
-    - name: "STEP 8 | TEST 3 — /api/users (expect 200)"
-      uri:
-        url: "{{ kong_proxy_url }}/api/users"
-        method: GET
-        headers:
-          apikey: "{{ api_key }}"
-        status_code: 200
-        timeout: 10
-      register: t3
-      tags: [test]
-
-    - name: "STEP 8 | TEST 3 PASSED"
-      debug:
-        msg: "/api/users → HTTP {{ t3.status }} ✔"
-      tags: [test]
-
-    - name: "STEP 8 | TEST 4 — /health (expect 200)"
-      uri:
-        url: "{{ kong_proxy_url }}/health"
-        method: GET
-        headers:
-          apikey: "{{ api_key }}"
-        status_code: 200
-        timeout: 10
-      register: t4
-      tags: [test]
-
-    - name: "STEP 8 | TEST 4 PASSED"
-      debug:
-        msg: "/health → HTTP {{ t4.status }} ✔"
-      tags: [test]
-
-    - name: "STEP 8 | TEST 5 — admin key (expect 200)"
-      uri:
-        url: "{{ kong_proxy_url }}/test-api/hello"
-        method: GET
-        headers:
-          apikey: "{{ admin_key }}"
-        status_code: 200
-        timeout: 10
-      register: t5
-      tags: [test]
-
-    - name: "STEP 8 | TEST 5 PASSED"
-      debug:
-        msg: "Admin key → HTTP {{ t5.status }} ✔"
-      tags: [test]
-
-    - name: "STEP 8 | Fetch entities"
-      uri:
-        url: "{{ kong_admin_url }}/{{ item }}"
-        return_content: yes
-      register: entities
-      loop: [services, routes, plugins, consumers]
-      tags: [test]
-
-    # ==========================================================
-    # STEP 9 — FINAL SUMMARY
-    # ==========================================================
-    - name: "STEP 9 | FINAL SUMMARY"
-      debug:
-        msg: |
-
-          ╔══════════════════════════════════════════════════════════════╗
-          ║      Kong API Gateway — DB-Less — ALL SYSTEMS GO!           ║
-          ╠══════════════════════════════════════════════════════════════╣
-          ║  Kong     : {{ health.json.version }}
-          ║  Database : {{ health.json.configuration.database }} (DB-Less — no PostgreSQL)
-          ║  Proxy    : http://localhost:{{ kong_proxy_port }}
-          ║  Admin    : http://localhost:{{ kong_admin_port }}
-          ║  Mock     : http://localhost:{{ mock_port }}
-          ╠══════════════════════════════════════════════════════════════╣
-          ║  TESTS                                                      ║
-          ║    No key  → 401 : {{ t1.status }} ✔
-          ║    API key → 200 : {{ t2.status }} ✔
-          ║    /api    → 200 : {{ t3.status }} ✔
-          ║    /health → 200 : {{ t4.status }} ✔
-          ║    Admin   → 200 : {{ t5.status }} ✔
-          ╠══════════════════════════════════════════════════════════════╣
-          ║  curl -i http://localhost:8000/test-api/hello \             ║
-          ║       -H "apikey: my-local-test-key-2024"   # 200          ║
-          ║  curl -i http://localhost:8000/test-api/hello               ║
-          ║                                              # 401          ║
-          ║  sudo kong reload -c /etc/kong/kong.conf    # reload       ║
-          ╚══════════════════════════════════════════════════════════════╝
-      tags: [test]
-
-  handlers:
-    - name: reload systemd
-      systemd:
-        daemon_reload: yes
+        var: kong_status.status
