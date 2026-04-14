@@ -2,8 +2,6 @@
 # ================================================================
 # FILE : kong_ansible.yml
 # RUN  : ansible-playbook kong_ansible.yml -v
-# FIX  : Mock backend now returns 200 for ALL paths (not just
-#        specific routes) — no more 404 on /health
 # ================================================================
 
 - name: Kong API Gateway — DB-Less Install and Test
@@ -14,15 +12,15 @@
   gather_facts: true
 
   vars:
-    kong_conf:         /etc/kong/kong.conf
-    kong_yml:          /etc/kong/kong.yml
-    kong_proxy_port:   8000
-    kong_admin_port:   8001
-    kong_admin_url:    "http://localhost:8001"
-    kong_proxy_url:    "http://localhost:8000"
-    mock_port:         9090
-    api_key:           "my-local-test-key-2024"
-    admin_key:         "admin-secret-key-2024"
+    kong_conf:       /etc/kong/kong.conf
+    kong_yml:        /etc/kong/kong.yml
+    kong_proxy_port: 8000
+    kong_admin_port: 8001
+    kong_admin_url:  "http://localhost:8001"
+    kong_proxy_url:  "http://localhost:8000"
+    mock_port:       9090
+    api_key:         "my-local-test-key-2024"
+    admin_key:       "admin-secret-key-2024"
 
   # ============================================================
   pre_tasks:
@@ -53,7 +51,7 @@
       failed_when: chk_pcre.rc != 0
       tags: always
 
-    - name: "PRE | Native deps confirmed"
+    - name: "PRE | All native deps confirmed"
       debug:
         msg:
           - "libopenssl : {{ chk_ssl.stdout.split()[2] }}"
@@ -81,9 +79,9 @@
       when: kong_bin.rc == 0
       tags: [install]
 
-    - name: "STEP 1 | Kong already present"
+    - name: "STEP 1 | Kong already present — skipping install"
       debug:
-        msg: "Skipping install — {{ kong_existing.stdout }}"
+        msg: "{{ kong_existing.stdout }}"
       when: kong_bin.rc == 0
       tags: [install]
 
@@ -118,14 +116,14 @@
       when: kong_bin.rc != 0
       tags: [install]
 
-    - name: "STEP 1 | apt update after Kong repo"
+    - name: "STEP 1 | apt update"
       shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
       when: kong_bin.rc != 0
       changed_when: false
       failed_when: false
       tags: [install]
 
-    - name: "STEP 1 | Check Kong package available"
+    - name: "STEP 1 | Check Kong in apt cache"
       shell: apt-cache show kong 2>&1 | head -3
       register: kong_cache
       when: kong_bin.rc != 0
@@ -144,7 +142,7 @@
         - "'Package: kong' not in (kong_cache.stdout | default(''))"
       tags: [install]
 
-    - name: "STEP 1 | apt update after fallback"
+    - name: "STEP 1 | apt update after fallback repo"
       shell: export DEBIAN_FRONTEND=noninteractive && apt-get update 2>&1
       when:
         - kong_bin.rc != 0
@@ -153,7 +151,7 @@
       changed_when: false
       tags: [install]
 
-    - name: "STEP 1 | Install Kong"
+    - name: "STEP 1 | Install Kong package"
       shell: export DEBIAN_FRONTEND=noninteractive && apt-get install -y kong 2>&1
       when: kong_bin.rc != 0
       changed_when: true
@@ -171,47 +169,70 @@
       tags: [install]
 
     # ==========================================================
-    # STEP 2 — MOCK BACKEND
-    # FIX: returns 200 for ALL paths using wildcard match
+    # STEP 2 — MOCK BACKEND (kill old + write new + restart)
     # ==========================================================
-    - name: "STEP 2 | Kill any process on port {{ mock_port }}"
-      shell: fuser -k {{ mock_port }}/tcp 2>/dev/null || true
+
+    # ── kill everything on port 9090 cleanly ─────────────────
+    - name: "STEP 2 | Stop kong-mock systemd service"
+      systemd:
+        name: kong-mock
+        state: stopped
+      failed_when: false
+      tags: [mock]
+
+    - name: "STEP 2 | Force kill any process on port {{ mock_port }}"
+      shell: |
+        fuser -k {{ mock_port }}/tcp 2>/dev/null || true
+        sleep 2
+        fuser -k {{ mock_port }}/tcp 2>/dev/null || true
       changed_when: false
       tags: [mock]
 
-    - name: "STEP 2 | Write mock backend (responds 200 to ALL paths)"
+    - name: "STEP 2 | Confirm port {{ mock_port }} is free"
+      shell: |
+        if fuser {{ mock_port }}/tcp 2>/dev/null; then
+          echo "PORT STILL IN USE"
+          exit 1
+        else
+          echo "Port {{ mock_port }} is free"
+        fi
+      register: port_check
+      changed_when: false
+      tags: [mock]
+
+    - name: "STEP 2 | Port status"
+      debug:
+        msg: "{{ port_check.stdout }}"
+      tags: [mock]
+
+    # ── write the NEW mock script ─────────────────────────────
+    - name: "STEP 2 | Write NEW mock backend script"
       copy:
         dest: /opt/kong-mock-server.py
         mode: "0755"
+        # Returns HTTP 200 for EVERY path — no route matching needed
         content: |
           #!/usr/bin/env python3
-          # Kong mock backend — returns 200 for EVERY path
           from http.server import HTTPServer, BaseHTTPRequestHandler
           import json, datetime, random, urllib.parse
 
           class Handler(BaseHTTPRequestHandler):
-
-              RESPONSES = {
-                  "hello":   {"message": "Hello from Kong DB-Less!"},
-                  "health":  {"status": "ok", "database": "none (db-less)"},
-                  "users":   {"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]},
-                  "orders":  {"orders": [{"id": 101, "item": "Widget"}]},
-                  "metrics": {"rps": random.randint(10, 50), "p99_ms": random.randint(1, 20)},
-              }
-
               def do_GET(self):
-                  parsed = urllib.parse.urlparse(self.path)
-                  # get the last segment of the path as the key
-                  key = parsed.path.strip("/").split("/")[-1]
-                  data = self.RESPONSES.get(key, {
-                      "message": "ok",
-                      "path": self.path
-                  })
+                  path = urllib.parse.urlparse(self.path).path
+                  seg  = path.strip("/").split("/")[-1] if path.strip("/") else "root"
+                  payloads = {
+                      "hello":   {"message": "Hello from Kong DB-Less!"},
+                      "health":  {"status": "ok", "db": "none"},
+                      "users":   {"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]},
+                      "orders":  {"orders": [{"id": 101, "item": "Widget"}]},
+                      "metrics": {"rps": random.randint(10,50), "p99_ms": random.randint(1,20)},
+                      "root":    {"message": "mock root ok"},
+                  }
                   body = json.dumps({
-                      **data,
-                      "full_path":  self.path,
-                      "mode":       "kong-db-less",
-                      "timestamp":  datetime.datetime.utcnow().isoformat() + "Z",
+                      **payloads.get(seg, {"message": "ok", "path": path}),
+                      "path": self.path,
+                      "mode": "db-less",
+                      "ts":   datetime.datetime.utcnow().isoformat() + "Z",
                   }, indent=2).encode()
                   self.send_response(200)
                   self.send_header("Content-Type",   "application/json")
@@ -219,24 +240,21 @@
                   self.send_header("Access-Control-Allow-Origin", "*")
                   self.end_headers()
                   self.wfile.write(body)
-
               def do_OPTIONS(self):
                   self.send_response(200)
                   self.send_header("Access-Control-Allow-Origin",  "*")
-                  self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                   self.send_header("Access-Control-Allow-Headers", "*")
                   self.end_headers()
-
               def log_message(self, fmt, *args):
-                  pass   # suppress access logs
+                  pass
 
           if __name__ == "__main__":
-              port = 9090
-              print(f"Kong mock backend listening on :{port} (200 for all paths)")
-              HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+              print("Mock backend :9090 — 200 for all paths")
+              HTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
       tags: [mock]
 
-    - name: "STEP 2 | Create mock systemd service"
+    # ── create / overwrite systemd unit ──────────────────────
+    - name: "STEP 2 | Write mock systemd unit"
       copy:
         dest: /lib/systemd/system/kong-mock.service
         mode: "0644"
@@ -255,39 +273,50 @@
           WantedBy=multi-user.target
       tags: [mock]
 
-    - name: "STEP 2 | Start mock backend"
+    - name: "STEP 2 | Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+      tags: [mock]
+
+    - name: "STEP 2 | Start mock backend fresh"
       systemd:
         name: kong-mock
-        daemon_reload: yes
-        state: restarted
+        state: started
         enabled: yes
       tags: [mock]
 
-    - name: "STEP 2 | Wait for mock backend on :{{ mock_port }}"
+    - name: "STEP 2 | Wait for port {{ mock_port }} to open"
       wait_for:
         host: localhost
         port: "{{ mock_port }}"
         delay: 2
-        timeout: 15
+        timeout: 20
       tags: [mock]
 
-    # FIX: test any path — / returns 200 now
-    - name: "STEP 2 | Verify mock backend (GET /)"
-      uri:
-        url: "http://localhost:{{ mock_port }}/"
-        method: GET
-        status_code: 200
-        return_content: yes
-      register: mock_resp
+    # ── verify with curl, not uri module ─────────────────────
+    - name: "STEP 2 | Verify mock backend with curl"
+      shell: |
+        curl -s -o /tmp/mock_test.txt \
+             -w "%{http_code}" \
+             --max-time 5 \
+             http://localhost:{{ mock_port }}/ping
+      register: mock_curl
+      changed_when: false
       tags: [mock]
 
-    - name: "STEP 2 | Mock backend OK"
+    - name: "STEP 2 | Mock backend HTTP status"
       debug:
-        msg: "Mock running on :{{ mock_port }} — HTTP {{ mock_resp.status }} ✔"
+        msg: "Mock backend returned HTTP {{ mock_curl.stdout }} ✔"
+      tags: [mock]
+
+    - name: "STEP 2 | Fail if mock not returning 200"
+      fail:
+        msg: "Mock backend returned HTTP {{ mock_curl.stdout }} — expected 200"
+      when: mock_curl.stdout != "200"
       tags: [mock]
 
     # ==========================================================
-    # STEP 3 — WRITE kong.conf (DB-Less)
+    # STEP 3 — WRITE kong.conf
     # ==========================================================
     - name: "STEP 3 | Stop Kong if running"
       service:
@@ -296,7 +325,7 @@
       failed_when: false
       tags: [configure]
 
-    - name: "STEP 3 | Write kong.conf"
+    - name: "STEP 3 | Write kong.conf (DB-Less)"
       copy:
         dest: "{{ kong_conf }}"
         owner: root
@@ -314,7 +343,7 @@
       tags: [configure]
 
     # ==========================================================
-    # STEP 4 — WRITE kong.yml (declarative config)
+    # STEP 4 — WRITE kong.yml
     # ==========================================================
     - name: "STEP 4 | Write kong.yml"
       copy:
@@ -326,7 +355,6 @@
           _transform: true
 
           services:
-
             - name: mock-service
               url: http://localhost:{{ mock_port }}
               connect_timeout: 5000
@@ -367,18 +395,12 @@
                 minute: 30
                 hour:   500
                 policy: local
-            - name: response-transformer
-              config:
-                add:
-                  headers:
-                    - "X-Kong-Mode:db-less"
-                    - "X-Powered-By:Kong-Gateway"
       tags: [configure]
 
     # ==========================================================
-    # STEP 5 — VALIDATE CONFIG SYNTAX
+    # STEP 5 — VALIDATE + START KONG
     # ==========================================================
-    - name: "STEP 5 | Validate kong.yml syntax"
+    - name: "STEP 5 | Validate kong.yml"
       command: kong config parse {{ kong_yml }}
       register: parse_out
       changed_when: false
@@ -389,9 +411,6 @@
         msg: "{{ parse_out.stdout | default('kong.yml syntax OK') }}"
       tags: [configure]
 
-    # ==========================================================
-    # STEP 6 — START KONG
-    # ==========================================================
     - name: "STEP 6 | Create Kong systemd unit"
       copy:
         dest: /lib/systemd/system/kong.service
@@ -450,28 +469,24 @@
         method: GET
         status_code: 200
         return_content: yes
-        timeout: 10
       register: health
       tags: [start, test]
 
     - name: "STEP 7 | Confirm DB-Less mode"
       debug:
-        msg: >
-          Kong v{{ health.json.version }} UP |
-          database = {{ health.json.configuration.database }} |
-          DB-Less = {{ health.json.configuration.database == 'off' }}
+        msg: "Kong v{{ health.json.version }} | database={{ health.json.configuration.database }} ✔"
       tags: [start, test]
 
     - name: "STEP 7 | Fail if not DB-Less"
       fail:
-        msg: "Kong is NOT in DB-Less mode (database={{ health.json.configuration.database }})"
+        msg: "Kong database={{ health.json.configuration.database }} (expected off)"
       when: health.json.configuration.database != 'off'
       tags: [start, test]
 
     # ==========================================================
     # STEP 8 — E2E TESTS
     # ==========================================================
-    - name: "STEP 8 | TEST 1 — no key → expect 401"
+    - name: "STEP 8 | TEST 1 — no key (expect 401)"
       uri:
         url: "{{ kong_proxy_url }}/test-api/hello"
         method: GET
@@ -482,10 +497,10 @@
 
     - name: "STEP 8 | TEST 1 PASSED"
       debug:
-        msg: "No key → HTTP {{ t1.status }} (401) ✔  key-auth is working"
+        msg: "No key → HTTP {{ t1.status }} ✔"
       tags: [test]
 
-    - name: "STEP 8 | TEST 2 — test-user key → expect 200"
+    - name: "STEP 8 | TEST 2 — with key (expect 200)"
       uri:
         url: "{{ kong_proxy_url }}/test-api/hello"
         method: GET
@@ -499,10 +514,10 @@
 
     - name: "STEP 8 | TEST 2 PASSED"
       debug:
-        msg: "With key → HTTP {{ t2.status }} ✔  Response: {{ t2.json.message | default('ok') }}"
+        msg: "With key → HTTP {{ t2.status }} | {{ t2.json.message | default('ok') }} ✔"
       tags: [test]
 
-    - name: "STEP 8 | TEST 3 — /api/users → expect 200"
+    - name: "STEP 8 | TEST 3 — /api/users (expect 200)"
       uri:
         url: "{{ kong_proxy_url }}/api/users"
         method: GET
@@ -510,16 +525,15 @@
           apikey: "{{ api_key }}"
         status_code: 200
         timeout: 10
-        return_content: yes
       register: t3
       tags: [test]
 
     - name: "STEP 8 | TEST 3 PASSED"
       debug:
-        msg: "/api route → HTTP {{ t3.status }} ✔"
+        msg: "/api/users → HTTP {{ t3.status }} ✔"
       tags: [test]
 
-    - name: "STEP 8 | TEST 4 — /health → expect 200"
+    - name: "STEP 8 | TEST 4 — /health (expect 200)"
       uri:
         url: "{{ kong_proxy_url }}/health"
         method: GET
@@ -532,10 +546,10 @@
 
     - name: "STEP 8 | TEST 4 PASSED"
       debug:
-        msg: "/health route → HTTP {{ t4.status }} ✔"
+        msg: "/health → HTTP {{ t4.status }} ✔"
       tags: [test]
 
-    - name: "STEP 8 | TEST 5 — admin key → expect 200"
+    - name: "STEP 8 | TEST 5 — admin key (expect 200)"
       uri:
         url: "{{ kong_proxy_url }}/test-api/hello"
         method: GET
@@ -551,51 +565,12 @@
         msg: "Admin key → HTTP {{ t5.status }} ✔"
       tags: [test]
 
-    - name: "STEP 8 | TEST 6 — rate-limit headers"
+    - name: "STEP 8 | Fetch entities"
       uri:
-        url: "{{ kong_proxy_url }}/test-api/hello"
-        method: GET
-        headers:
-          apikey: "{{ api_key }}"
-        status_code: 200
-        timeout: 10
-      register: t6
-      tags: [test]
-
-    - name: "STEP 8 | TEST 6 — rate-limit header values"
-      debug:
-        msg: >
-          RateLimit-Limit={{ t6.x_ratelimit_limit_minute | default('present') }}
-          Remaining={{ t6.x_ratelimit_remaining_minute | default('present') }} ✔
-      tags: [test]
-
-    # ── list all loaded entities ──────────────────────────────
-    - name: "STEP 8 | Fetch services"
-      uri:
-        url: "{{ kong_admin_url }}/services"
+        url: "{{ kong_admin_url }}/{{ item }}"
         return_content: yes
-      register: svc_list
-      tags: [test]
-
-    - name: "STEP 8 | Fetch routes"
-      uri:
-        url: "{{ kong_admin_url }}/routes"
-        return_content: yes
-      register: route_list
-      tags: [test]
-
-    - name: "STEP 8 | Fetch plugins"
-      uri:
-        url: "{{ kong_admin_url }}/plugins"
-        return_content: yes
-      register: plugin_list
-      tags: [test]
-
-    - name: "STEP 8 | Fetch consumers"
-      uri:
-        url: "{{ kong_admin_url }}/consumers"
-        return_content: yes
-      register: consumer_list
+      register: entities
+      loop: [services, routes, plugins, consumers]
       tags: [test]
 
     # ==========================================================
@@ -605,42 +580,28 @@
       debug:
         msg: |
 
-          ╔═══════════════════════════════════════════════════════════════╗
-          ║       Kong API Gateway — DB-Less — ALL SYSTEMS GO!           ║
-          ╠═══════════════════════════════════════════════════════════════╣
-          ║  Kong Version  : {{ health.json.version }}
-          ║  Database      : {{ health.json.configuration.database }} (DB-Less — no PostgreSQL)
-          ║  Proxy         : http://localhost:{{ kong_proxy_port }}
-          ║  Admin API     : http://localhost:{{ kong_admin_port }}
-          ║  Mock Backend  : http://localhost:{{ mock_port }}
-          ╠═══════════════════════════════════════════════════════════════╣
-          ║  Services  : {{ svc_list.json.data | map(attribute='name') | list }}
-          ║  Routes    : {{ route_list.json.data | map(attribute='name') | list }}
-          ║  Plugins   : {{ plugin_list.json.data | map(attribute='name') | list }}
-          ║  Consumers : {{ consumer_list.json.data | map(attribute='username') | list }}
-          ╠═══════════════════════════════════════════════════════════════╣
-          ║  TEST RESULTS                                                ║
-          ║    Test 1 — No key   → 401  : {{ t1.status }} ✔
-          ║    Test 2 — API key  → 200  : {{ t2.status }} ✔
-          ║    Test 3 — /api     → 200  : {{ t3.status }} ✔
-          ║    Test 4 — /health  → 200  : {{ t4.status }} ✔
-          ║    Test 5 — admin    → 200  : {{ t5.status }} ✔
-          ╠═══════════════════════════════════════════════════════════════╣
-          ║  QUICK TEST COMMANDS                                         ║
-          ║                                                              ║
-          ║  # Authenticated (200)                                       ║
+          ╔══════════════════════════════════════════════════════════════╗
+          ║      Kong API Gateway — DB-Less — ALL SYSTEMS GO!           ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║  Kong     : {{ health.json.version }}
+          ║  Database : {{ health.json.configuration.database }} (DB-Less — no PostgreSQL)
+          ║  Proxy    : http://localhost:{{ kong_proxy_port }}
+          ║  Admin    : http://localhost:{{ kong_admin_port }}
+          ║  Mock     : http://localhost:{{ mock_port }}
+          ╠══════════════════════════════════════════════════════════════╣
+          ║  TESTS                                                      ║
+          ║    No key  → 401 : {{ t1.status }} ✔
+          ║    API key → 200 : {{ t2.status }} ✔
+          ║    /api    → 200 : {{ t3.status }} ✔
+          ║    /health → 200 : {{ t4.status }} ✔
+          ║    Admin   → 200 : {{ t5.status }} ✔
+          ╠══════════════════════════════════════════════════════════════╣
           ║  curl -i http://localhost:8000/test-api/hello \             ║
-          ║       -H "apikey: my-local-test-key-2024"                  ║
-          ║                                                              ║
-          ║  # No key (401)                                             ║
+          ║       -H "apikey: my-local-test-key-2024"   # 200          ║
           ║  curl -i http://localhost:8000/test-api/hello               ║
-          ║                                                              ║
-          ║  # Admin API                                                ║
-          ║  curl -s http://localhost:8001 | python3 -m json.tool       ║
-          ║                                                              ║
-          ║  # Reload config (no restart needed)                        ║
-          ║  sudo kong reload -c /etc/kong/kong.conf                   ║
-          ╚═══════════════════════════════════════════════════════════════╝
+          ║                                              # 401          ║
+          ║  sudo kong reload -c /etc/kong/kong.conf    # reload       ║
+          ╚══════════════════════════════════════════════════════════════╝
       tags: [test]
 
   handlers:
